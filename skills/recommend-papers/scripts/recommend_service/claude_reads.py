@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .metadata import clean
-from .storage import now_iso, read_json, safe_write_target, update_run, write_json, write_text
+from .storage import now_iso, read_json, require_run, stable_hash, update_run, write_json, write_text
 
 MAX_CLAUDE_CONCURRENCY = 16
 
@@ -46,6 +46,8 @@ def claude_status() -> dict[str, Any]:
 
 def _queue_items(run_dir: Path, *, only_failed: bool) -> list[dict[str, Any]]:
     queue = read_json(run_dir / "reading_queue.json", {})
+    if not isinstance(queue, dict) or queue.get("status") not in {"pending", "ready_for_validation"}:
+        raise ValueError("reading_queue.json is missing; run prepare-reads first")
     items = [item for item in queue.get("pending") or [] if isinstance(item, dict)]
     if not only_failed:
         return items
@@ -140,7 +142,17 @@ def _run_one(claude: str, item: dict[str, Any], timeout_sec: int, repair_suffix:
 
 
 def run_claude_reads(run_dir: Path, *, timeout_sec: int = 1800, only_failed: bool = False, workers: int = MAX_CLAUDE_CONCURRENCY) -> dict[str, Any]:
-    directory = safe_write_target(run_dir)
+    directory = require_run(run_dir)
+    plan = read_json(directory / "plan.json", {})
+    if not isinstance(plan, dict) or read_json(directory / "metadata.json", {}).get("plan_fingerprint") != stable_hash(plan):
+        raise ValueError("plan.json changed after metadata acquisition; create a child run or rerun metadata")
+    workflow = plan.get("workflow") if isinstance(plan, dict) and isinstance(plan.get("workflow"), dict) else {}
+    if clean(workflow.get("stop_after")).lower() not in {"reading", "recommendation"}:
+        raise ValueError("Plan does not authorize a reading stage")
+    if clean(workflow.get("reading_preference")).lower() == "codex_fast":
+        raise ValueError("Plan selects the three-Codex fast fallback; Claude reads are forbidden for this run")
+    if read_json(directory / "reading_mode.json", {}).get("mode") != "external_claude_per_paper":
+        raise ValueError("Claude reads require prepare-reads to select external_claude_per_paper mode")
     availability = claude_status()
     claude = clean(availability.get("path"))
     items = _queue_items(directory, only_failed=only_failed)
@@ -155,6 +167,7 @@ def run_claude_reads(run_dir: Path, *, timeout_sec: int = 1800, only_failed: boo
             "generated_at": now_iso(),
         }
         write_json(directory / "claude_read_results.json", payload)
+        update_run(directory, stage="claude_unavailable", counts={"claude_reads_requested": len(items)})
         return payload
     if not items:
         return {"schema_version": 1, "status": "complete", "requested_count": 0, "completed_count": 0, "worker_count": 0, "max_concurrency": MAX_CLAUDE_CONCURRENCY, "pipeline_refill": True, "items": [], "generated_at": now_iso()}

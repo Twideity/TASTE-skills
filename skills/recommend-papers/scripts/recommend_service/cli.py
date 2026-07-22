@@ -16,21 +16,63 @@ from .claude_reads import claude_status, run_claude_reads
 from .metadata import catalog, clean, metadata_cache_inventory, migrate_metadata_caches, probe_venue
 from .pipeline import build_shortlist, complete, finalize, finish_stage, run_fulltext, run_metadata
 from .reading_artifacts import prepare_fast_batches, prepare_reads, validate_reads
-from .storage import CACHE_ROOT, RUNS_ROOT, STATE_ROOT, create_run, git_root_for, read_json, write_json
+from .storage import CACHE_ROOT, RUNS_ROOT, STATE_ROOT, create_run, git_root_for, read_json, require_run, write_json
+
+
+PROBE_DIAGNOSTIC_SAMPLE_LIMIT = 3
+
+
+def _command_exit_code(command: str, result: dict[str, Any]) -> int:
+    """Partial/action-required states must not look like successful endpoints."""
+    status = clean(result.get("status")).lower()
+    accepted = {
+        "doctor": {"ok"},
+        "cache-status": {"ok"},
+        "migrate-metadata-cache": {"complete"},
+        "init-run": {"initialized"},
+        "probe-venue": {"probe_available"},
+        "metadata": {"complete"},
+        "fulltext": {"complete", "complete_with_gaps"},
+        "prepare-reads": {"pending", "ready_for_validation"},
+        "claude-reads": {"complete"},
+        "prepare-fast-read-batches": {"ready"},
+        "validate-reads": {"complete"},
+        "complete": {"complete"},
+        "finish-stage": {"complete"},
+    }
+    if command in accepted:
+        return 0 if status in accepted[command] else 2
+    return 2 if status in {"error", "blocked", "probe_error", "temporarily_unresolved", "unavailable"} else 0
 
 
 def initialize_run(*, parent_run_dir: Path | None = None, mode: str = "", question: str = "") -> dict[str, Any]:
     parent_payload: dict[str, Any] = {}
     if parent_run_dir is not None:
-        parent = parent_run_dir.expanduser().resolve()
+        parent = require_run(parent_run_dir, mutable=False)
         parent_state = read_json(parent / "run.json", None)
-        if not isinstance(parent_state, dict) or not parent_state.get("run_id"):
-            raise ValueError("parent-run-dir must point to an existing recommend-papers run")
+        if parent_state.get("status") != "complete":
+            raise ValueError("parent-run-dir must be complete and immutable; continue an active run directly")
         artifact_names = ("plan.json", "metadata.json", "shortlist.json", "full_text_results.json", "read_artifacts.json", "evidence_cards.validated.json", "final_ranking.json", "recommendations.md")
+        parent_plan = read_json(parent / "plan.json", {})
+        parent_workflow = (parent_plan.get("workflow") if isinstance(parent_plan, dict) else {}) or {}
+        inherited_settings = {}
+        if (
+            isinstance(parent_workflow, dict)
+            and parent_workflow.get("user_disabled_claude") is True
+            and parent_workflow.get("conversation_reading_preference_locked") is True
+            and clean(parent_workflow.get("reading_preference_scope")).lower() == "conversation"
+        ):
+            inherited_settings = {
+                "reading_preference": "codex_fast",
+                "user_disabled_claude": True,
+                "reading_preference_scope": "conversation",
+                "conversation_reading_preference_locked": True,
+            }
         parent_payload = {
             "parent_run_id": parent_state["run_id"],
             "parent_run_dir": str(parent),
             "available_parent_artifacts": {name: str(parent / name) for name in artifact_names if (parent / name).is_file()},
+            **({"inherited_workflow_settings": inherited_settings} if inherited_settings else {}),
         }
     run_dir = create_run()
     continuation = {
@@ -100,9 +142,51 @@ def doctor() -> dict[str, Any]:
 
 
 def inspect_run(run_dir: Path) -> dict[str, Any]:
-    root = run_dir.expanduser().resolve()
+    root = require_run(run_dir, mutable=False)
     files = [{"path": str(path), "bytes": path.stat().st_size} for path in sorted(root.rglob("*")) if path.is_file()]
     return {"run_dir": str(root), "state": read_json(root / "run.json", {}), "file_count": len(files), "files": files}
+
+
+def _execute(args: argparse.Namespace) -> dict[str, Any]:
+    if args.command == "doctor":
+        return doctor()
+    if args.command == "cache-status":
+        return {"status": "ok", **metadata_cache_inventory()}
+    if args.command == "migrate-metadata-cache":
+        return migrate_metadata_caches()
+    if args.command == "init-run":
+        return initialize_run(parent_run_dir=args.parent_run_dir, mode=args.mode, question=args.question)
+    if args.command == "catalog":
+        return catalog(args.query)
+    if args.command == "probe-venue":
+        return probe_venue(
+            {"type": "venue", "venue_id": args.venue_id, "venue": args.venue, "adapter": args.adapter, "openreview_venue_id": args.openreview_venue_id},
+            args.start_year,
+            args.lookback,
+            PROBE_DIAGNOSTIC_SAMPLE_LIMIT,
+            args.run_dir,
+        )
+    if args.command == "metadata":
+        return run_metadata(args.plan.resolve(), args.run_dir)
+    if args.command == "shortlist":
+        return build_shortlist(args.run_dir.resolve(), args.scores.resolve(), args.target)
+    if args.command == "fulltext":
+        return run_fulltext(args.run_dir.resolve(), args.workers)
+    if args.command == "prepare-reads":
+        return prepare_reads(args.run_dir.resolve())
+    if args.command == "claude-reads":
+        return run_claude_reads(args.run_dir.resolve(), timeout_sec=args.timeout, only_failed=args.only_failed, workers=args.workers)
+    if args.command == "prepare-fast-read-batches":
+        return prepare_fast_batches(args.run_dir.resolve())
+    if args.command == "validate-reads":
+        return validate_reads(args.run_dir.resolve())
+    if args.command == "finalize":
+        return finalize(args.run_dir.resolve(), args.evidence_cards.resolve(), args.target)
+    if args.command == "complete":
+        return complete(args.run_dir.resolve(), args.recommendations.resolve())
+    if args.command == "finish-stage":
+        return finish_stage(args.run_dir.resolve(), args.stage)
+    return inspect_run(args.run_dir)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -124,15 +208,14 @@ def main(argv: list[str] | None = None) -> int:
     probe.add_argument("--openreview-venue-id", default="")
     probe.add_argument("--start-year", type=int, default=datetime.now().year)
     probe.add_argument("--lookback", type=int, default=5)
-    probe.add_argument("--sample-limit", type=int, default=3)
-    probe.add_argument("--run-dir", type=Path)
+    probe.add_argument("--run-dir", type=Path, required=True)
     meta = sub.add_parser("metadata")
     meta.add_argument("--plan", type=Path, required=True)
-    meta.add_argument("--run-dir", type=Path)
+    meta.add_argument("--run-dir", type=Path, required=True)
     shortlist = sub.add_parser("shortlist")
     shortlist.add_argument("--run-dir", type=Path, required=True)
     shortlist.add_argument("--scores", type=Path, required=True)
-    shortlist.add_argument("--target", type=int, default=100)
+    shortlist.add_argument("--target", type=int)
     full = sub.add_parser("fulltext")
     full.add_argument("--run-dir", type=Path, required=True)
     full.add_argument("--workers", type=int, default=8)
@@ -150,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
     final = sub.add_parser("finalize")
     final.add_argument("--run-dir", type=Path, required=True)
     final.add_argument("--evidence-cards", type=Path, required=True)
-    final.add_argument("--target", type=int, default=20)
+    final.add_argument("--target", type=int)
     done = sub.add_parser("complete")
     done.add_argument("--run-dir", type=Path, required=True)
     done.add_argument("--recommendations", type=Path, required=True)
@@ -160,45 +243,14 @@ def main(argv: list[str] | None = None) -> int:
     inspect = sub.add_parser("inspect")
     inspect.add_argument("--run-dir", type=Path, required=True)
     args = parser.parse_args(argv)
-    if args.command == "doctor":
-        result = doctor()
-    elif args.command == "cache-status":
-        result = {"status": "ok", **metadata_cache_inventory()}
-    elif args.command == "migrate-metadata-cache":
-        result = migrate_metadata_caches()
-    elif args.command == "init-run":
-        result = initialize_run(parent_run_dir=args.parent_run_dir, mode=args.mode, question=args.question)
-    elif args.command == "catalog":
-        result = catalog(args.query)
-    elif args.command == "probe-venue":
-        result = probe_venue(
-            {"type": "venue", "venue_id": args.venue_id, "venue": args.venue, "adapter": args.adapter, "openreview_venue_id": args.openreview_venue_id},
-            args.start_year,
-            args.lookback,
-            args.sample_limit,
-            args.run_dir,
-        )
-    elif args.command == "metadata":
-        result = run_metadata(args.plan.resolve(), args.run_dir)
-    elif args.command == "shortlist":
-        result = build_shortlist(args.run_dir.resolve(), args.scores.resolve(), args.target)
-    elif args.command == "fulltext":
-        result = run_fulltext(args.run_dir.resolve(), args.workers)
-    elif args.command == "prepare-reads":
-        result = prepare_reads(args.run_dir.resolve())
-    elif args.command == "claude-reads":
-        result = run_claude_reads(args.run_dir.resolve(), timeout_sec=args.timeout, only_failed=args.only_failed, workers=args.workers)
-    elif args.command == "prepare-fast-read-batches":
-        result = prepare_fast_batches(args.run_dir.resolve())
-    elif args.command == "validate-reads":
-        result = validate_reads(args.run_dir.resolve())
-    elif args.command == "finalize":
-        result = finalize(args.run_dir.resolve(), args.evidence_cards.resolve(), args.target)
-    elif args.command == "complete":
-        result = complete(args.run_dir.resolve(), args.recommendations.resolve())
-    elif args.command == "finish-stage":
-        result = finish_stage(args.run_dir.resolve(), args.stage)
-    else:
-        result = inspect_run(args.run_dir)
+    try:
+        result = _execute(args)
+    except Exception as exc:
+        result = {
+            "status": "error",
+            "command": args.command,
+            "error_type": type(exc).__name__,
+            "message": str(exc)[:2000],
+        }
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if result.get("status") not in {"error", "blocked"} else 2
+    return _command_exit_code(args.command, result)

@@ -7,7 +7,7 @@ from typing import Any
 
 from .fulltext import FULLTEXT_CACHE_ROOT, cache_key
 from .metadata import clean
-from .storage import now_iso, read_json, safe_write_target, update_run, write_json, write_text
+from .storage import now_iso, read_json, require_run, safe_write_target, stable_hash, update_run, write_json, write_text
 
 
 SECTIONS = ("摘要", "动机与核心创新", "方法", "实验结果", "优缺点总结")
@@ -18,12 +18,33 @@ _PROSE_LATEX_COMMAND_RE = re.compile(r"\\[A-Za-z]+")
 _MARKDOWN_PROTECTED_SPAN_RE = re.compile(r"```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`|\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\]|\\\([^\n]*?\\\)|(?<!\\)\$[^$\n]*?(?<!\\)\$")
 
 
+def _reading_workflow(run_dir: Path) -> dict[str, Any]:
+    plan = read_json(run_dir / "plan.json", {})
+    metadata = read_json(run_dir / "metadata.json", {})
+    if not isinstance(plan, dict) or metadata.get("plan_fingerprint") != stable_hash(plan):
+        raise ValueError("plan.json changed after metadata acquisition; create a child run or rerun metadata")
+    workflow = plan.get("workflow") if isinstance(plan, dict) and isinstance(plan.get("workflow"), dict) else {}
+    if clean(workflow.get("stop_after")).lower() not in {"reading", "recommendation"}:
+        raise ValueError("Plan does not authorize a reading stage")
+    return workflow
+
+
 def _fulltext_items(run_dir: Path) -> list[dict[str, Any]]:
+    run_dir = require_run(run_dir)
     payload = read_json(run_dir / "full_text_results.json", {})
     items = payload.get("items") if isinstance(payload, dict) else None
     if not isinstance(items, list):
         raise ValueError("full_text_results.json is missing")
-    return [item for item in items if isinstance(item, dict) and item.get("full_text_available") is True]
+    if payload.get("status") not in {"complete", "complete_with_gaps"}:
+        raise ValueError("full_text_results.json is not a completed acquisition pass")
+    metadata = read_json(run_dir / "metadata.json", {})
+    shortlist = read_json(run_dir / "shortlist.json", {})
+    if payload.get("metadata_fingerprint") != metadata.get("metadata_fingerprint") or payload.get("shortlist_fingerprint") != stable_hash(shortlist):
+        raise ValueError("full_text_results.json is stale because metadata or shortlist changed")
+    ready = [item for item in items if isinstance(item, dict) and item.get("full_text_available") is True]
+    if not ready:
+        raise ValueError("No successfully acquired full texts are available for reading")
+    return ready
 
 
 def _file_sha256(path: Path) -> str:
@@ -196,7 +217,10 @@ receipt JSON 必须满足：
 
 
 def prepare_reads(run_dir: Path) -> dict[str, Any]:
-    directory = safe_write_target(run_dir)
+    directory = require_run(run_dir)
+    workflow = _reading_workflow(directory)
+    if clean(workflow.get("reading_preference")).lower() == "codex_fast":
+        raise ValueError("Plan selects the three-Codex fast fallback; do not prepare Claude per-paper reads")
     items = _fulltext_items(directory)
     restored = []
     pending = []
@@ -248,8 +272,17 @@ def prepare_reads(run_dir: Path) -> dict[str, Any]:
 
 
 def prepare_fast_batches(run_dir: Path) -> dict[str, Any]:
-    directory = safe_write_target(run_dir)
+    directory = require_run(run_dir)
+    workflow = _reading_workflow(directory)
+    explicit_fast = (
+        clean(workflow.get("reading_preference")).lower() == "codex_fast"
+        and (workflow.get("user_disabled_claude") is True or workflow.get("claude_unavailable") is True)
+    )
+    observed_unavailable = read_json(directory / "claude_read_results.json", {}).get("status") == "claude_unavailable"
+    if not explicit_fast and not observed_unavailable:
+        raise ValueError("Fast three-Codex reading requires an explicit no-Claude plan or a claude_unavailable receipt")
     items = _fulltext_items(directory)
+    fulltext_fingerprint = stable_hash(read_json(directory / "full_text_results.json", {}))
     base, remainder = divmod(len(items), 3)
     sizes = [base + (1 if index < remainder else 0) for index in range(3)]
     batches = []
@@ -282,6 +315,8 @@ def prepare_fast_batches(run_dir: Path) -> dict[str, Any]:
         "paper_count": len(items),
         "batch_count": 3,
         "batch_sizes": sizes,
+        "fulltext_results_fingerprint": fulltext_fingerprint,
+        "authorization": "user_disabled_claude" if workflow.get("user_disabled_claude") is True else "plan_claude_unavailable" if workflow.get("claude_unavailable") is True else "observed_claude_unavailable",
         "batches": batches,
         "generated_at": now_iso(),
     }
@@ -497,7 +532,10 @@ def _aggregate(items: list[dict[str, Any]]) -> str:
 
 
 def validate_reads(run_dir: Path) -> dict[str, Any]:
-    directory = safe_write_target(run_dir)
+    directory = require_run(run_dir)
+    workflow = _reading_workflow(directory)
+    if clean(workflow.get("reading_preference")).lower() == "codex_fast":
+        raise ValueError("Plan selects the three-Codex fast fallback; per-paper Claude validation is not applicable")
     items = _fulltext_items(directory)
     validated = []
     validated_texts = []
@@ -537,7 +575,7 @@ def validate_reads(run_dir: Path) -> dict[str, Any]:
         write_json(cache_dir / "read_receipt.json", receipt)
         validated.append({"identity": item.get("identity"), "title": title, "full_text_path": item.get("text_path"), "read_path": str(read_path), "receipt_path": str(receipt_path), "cache_path": str(cache_dir / "read.md")})
     status = "complete" if len(validated) == len(items) and items else "blocked"
-    payload = {"schema_version": 1, "read_contract_version": READ_CONTRACT_VERSION, "status": status, "required_count": len(items), "validated_count": len(validated), "failed_count": len(failures), "items": validated, "failures": failures, "generated_at": now_iso()}
+    payload = {"schema_version": 1, "read_contract_version": READ_CONTRACT_VERSION, "status": status, "required_count": len(items), "validated_count": len(validated), "failed_count": len(failures), "items": validated, "failures": failures, "fulltext_results_fingerprint": stable_hash(read_json(directory / "full_text_results.json", {})), "generated_at": now_iso()}
     write_json(directory / "read_artifacts.json", payload)
     if status == "complete":
         write_text(directory / "read.md", _aggregate(validated))

@@ -7,13 +7,14 @@ from typing import Any
 from .fulltext import acquire_many
 from .metadata import clean, deduplicate, fetch_source, migrate_metadata_caches, paper_identity, validate_plan
 from .reading_artifacts import READ_CONTRACT_VERSION
-from .storage import ensure_run, now_iso, read_json, run_lock, stable_hash, update_run, write_json, write_text
+from .storage import now_iso, read_json, require_run, run_lock, stable_hash, update_run, write_json, write_text
 
 
 METADATA_COMPONENTS = ("topic_fit", "transferability_potential", "abstract_specificity")
 METADATA_MAXIMA = {"topic_fit": 50, "transferability_potential": 30, "abstract_specificity": 20}
 FULLTEXT_COMPONENTS = ("match_score", "transferability_score")
 FULLTEXT_MAXIMA = {"match_score": 10, "transferability_score": 10}
+STAGE_ORDER = {"metadata": 0, "shortlist": 1, "fulltext": 2, "reading": 3, "recommendation": 4}
 
 
 def _number(value: Any, *, label: str, minimum: float = 0, maximum: float = 100) -> float:
@@ -26,15 +27,95 @@ def _number(value: Any, *, label: str, minimum: float = 0, maximum: float = 100)
     return result
 
 
+def _require_stage_allowed(directory: Path, stage: str) -> dict[str, Any]:
+    plan = read_json(directory / "plan.json", {})
+    workflow = plan.get("workflow") if isinstance(plan, dict) and isinstance(plan.get("workflow"), dict) else {}
+    stop_after = clean(workflow.get("stop_after")).lower()
+    if stop_after not in STAGE_ORDER:
+        raise ValueError("plan.json lacks a valid workflow.stop_after")
+    if STAGE_ORDER[stage] > STAGE_ORDER[stop_after]:
+        raise ValueError(f"Plan stops after {stop_after}; {stage} would exceed the authorized workflow")
+    return plan
+
+
+def _require_plan_unchanged(directory: Path, plan: dict[str, Any] | None = None) -> dict[str, Any]:
+    current = plan if isinstance(plan, dict) else read_json(directory / "plan.json", {})
+    metadata = read_json(directory / "metadata.json", {})
+    if not isinstance(current, dict) or metadata.get("plan_fingerprint") != stable_hash(current):
+        raise ValueError("plan.json changed after metadata acquisition; create a child run or rerun metadata")
+    return current
+
+
 def run_metadata(plan_path: Path, run_dir: Path | None = None) -> dict[str, Any]:
-    directory = ensure_run(run_dir)
+    if run_dir is None:
+        raise ValueError("metadata requires an explicit initialized run-dir")
+    directory = require_run(run_dir)
+    if plan_path.expanduser().resolve() != (directory / "plan.json").resolve():
+        raise ValueError("metadata plan must be the plan.json inside the initialized run directory")
     with run_lock(directory, "metadata"):
         return _run_metadata_locked(plan_path, directory)
+
+
+def _venue_key(value: Any) -> str:
+    key = clean(value).lower()
+    return {"sigkdd": "kdd", "nips": "neurips", "thewebconference": "www", "webconf": "www"}.get(key, key)
+
+
+def _require_venue_probe_receipts(plan: dict[str, Any], directory: Path) -> list[dict[str, Any]]:
+    receipts = []
+    for path in sorted((directory / "venue_probes").glob("*.json")):
+        payload = read_json(path, {})
+        if isinstance(payload, dict):
+            receipts.append((path, payload))
+    proofs: list[dict[str, Any]] = []
+    for index, source in enumerate(plan.get("sources") or []):
+        if clean(source.get("type")).lower() != "venue":
+            continue
+        venue = _venue_key(source.get("venue_id") or source.get("venue"))
+        year = int((source.get("years") or [0])[0])
+        match = next((
+            (path, payload)
+            for path, payload in reversed(receipts)
+            if payload.get("status") == "probe_available"
+            and payload.get("probe_only") is True
+            and payload.get("research_output") is False
+            and payload.get("complete_catalog") is False
+            and int(payload.get("resolved_year") or 0) == year
+            and _venue_key((payload.get("source") or {}).get("venue_id") or (payload.get("source") or {}).get("venue")) == venue
+        ), None)
+        if match is None:
+            raise ValueError(
+                f"sources[{index}] {venue or 'venue'} {year} lacks a successful diagnostic probe receipt in this run; "
+                "run probe-venue first. Probe samples are never metadata input."
+            )
+        path, payload = match
+        if source.get("latest_usable_year") is True:
+            as_of = clean((plan.get("request_scope") or {}).get("as_of_date"))
+            try:
+                expected_start_year = int(as_of[:4])
+            except (TypeError, ValueError):
+                raise ValueError("latest_usable_year requires request_scope.as_of_date")
+            if int(payload.get("requested_year") or 0) != expected_start_year:
+                raise ValueError(
+                    f"sources[{index}] {venue} claims latest usable year, but its probe did not start at {expected_start_year}"
+                )
+        proofs.append({"venue": venue, "year": year, "receipt_path": str(path), "receipt_fingerprint": stable_hash(payload)})
+    return proofs
 
 
 def _run_metadata_locked(plan_path: Path, directory: Path) -> dict[str, Any]:
     migrate_metadata_caches()
     plan = validate_plan(read_json(plan_path, {}))
+    continuation = read_json(directory / "continuation.json", {})
+    inherited = continuation.get("inherited_workflow_settings") if isinstance(continuation, dict) else {}
+    if isinstance(inherited, dict) and inherited:
+        workflow = plan.get("workflow") or {}
+        mismatched = [key for key, value in inherited.items() if workflow.get(key) != value]
+        if mismatched:
+            raise ValueError(
+                "Child plan violates the inherited conversation-level reading preference: " + ", ".join(mismatched)
+            )
+    probe_proofs = _require_venue_probe_receipts(plan, directory)
     write_json(directory / "plan.json", plan)
     policy = clean(plan.get("cache_policy") or "reuse").lower()
     if policy not in {"reuse", "refresh", "only"}:
@@ -71,13 +152,16 @@ def _run_metadata_locked(plan_path: Path, directory: Path) -> dict[str, Any]:
         "generated_at": now_iso(),
         "raw_count": len(all_rows),
         "deduplicated_count": len(papers),
-        "metadata_fingerprint": stable_hash({"plan": plan, "papers": papers}),
+        "probe_proofs": probe_proofs,
+        "plan_fingerprint": stable_hash(plan),
+        "metadata_fingerprint": stable_hash({"plan": plan, "probe_proofs": probe_proofs, "papers": papers}),
         "papers": papers,
         "source_receipts": receipts,
         "warnings": warnings,
     }
     write_json(directory / "metadata.json", payload)
-    update_run(directory, stage="metadata_ready" if papers else "metadata_blocked", status="active" if papers else "blocked", counts={"sources": len(sources), "completed_sources": len(sources), "raw_papers": len(all_rows), "metadata_papers": len(papers)}, warnings=warnings)
+    stage = "metadata_ready" if status == "complete" else "metadata_incomplete" if papers else "metadata_blocked"
+    update_run(directory, stage=stage, status="active" if papers else "blocked", counts={"sources": len(sources), "completed_sources": len(sources), "raw_papers": len(all_rows), "metadata_papers": len(papers)}, warnings=warnings)
     return payload
 
 
@@ -91,8 +175,10 @@ def _score_rows(payload: Any) -> list[dict[str, Any]]:
     raise ValueError("Score artifact must be a list or contain scores/papers/items")
 
 
-def build_shortlist(run_dir: Path, scores_path: Path, target: int) -> dict[str, Any]:
-    directory = ensure_run(run_dir)
+def build_shortlist(run_dir: Path, scores_path: Path, target: int | None) -> dict[str, Any]:
+    directory = require_run(run_dir)
+    plan = _require_stage_allowed(directory, "shortlist")
+    _require_plan_unchanged(directory, plan)
     metadata = read_json(directory / "metadata.json", {})
     papers = metadata.get("papers") if isinstance(metadata, dict) else None
     if not isinstance(papers, list) or not papers:
@@ -123,7 +209,12 @@ def build_shortlist(run_dir: Path, scores_path: Path, target: int) -> dict[str, 
     if missing:
         raise ValueError(f"Codex must score every metadata paper before shortlisting; missing={len(missing)}")
     ordered = sorted(scored.values(), key=lambda item: (-item["metadata_score"], item["identity"]))
-    target_count = max(1, int(target or 100))
+    planned_target = (plan.get("workflow") or {}).get("shortlist_target")
+    if target is not None and planned_target is not None and int(target) != int(planned_target):
+        raise ValueError("--target conflicts with workflow.shortlist_target")
+    target_count = int(target if target is not None else planned_target or 100)
+    if target_count < 1:
+        raise ValueError("shortlist target must be a positive integer")
     selected = ordered[:target_count]
     shortlist_papers = [{**by_identity[item["identity"]], "metadata_evaluation": item} for item in selected]
     scores_payload = {"schema_version": 1, "run_id": directory.name, "scored_count": len(ordered), "scores": ordered, "generated_at": now_iso()}
@@ -144,12 +235,16 @@ def build_shortlist(run_dir: Path, scores_path: Path, target: int) -> dict[str, 
 
 
 def run_fulltext(run_dir: Path, workers: int) -> dict[str, Any]:
-    directory = ensure_run(run_dir)
+    directory = require_run(run_dir)
+    plan = _require_stage_allowed(directory, "fulltext")
+    _require_plan_unchanged(directory, plan)
     shortlist = read_json(directory / "shortlist.json", {})
     papers = shortlist.get("papers") if isinstance(shortlist, dict) else None
     if not isinstance(papers, list) or not papers:
         raise ValueError("shortlist.json is missing or empty")
     metadata = read_json(directory / "metadata.json", {})
+    if metadata.get("status") != "complete":
+        raise ValueError("metadata coverage is incomplete; full-text acquisition requires complete formal metadata")
     if shortlist.get("metadata_fingerprint") != metadata.get("metadata_fingerprint"):
         raise ValueError("shortlist.json is stale because metadata changed; rerun scoring and shortlist")
     result = acquire_many(papers, directory, workers)
@@ -174,14 +269,48 @@ def _jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def finalize(run_dir: Path, evidence_path: Path, target: int) -> dict[str, Any]:
-    directory = ensure_run(run_dir)
+def _fast_card_valid(card: dict[str, Any], expected: dict[str, Any], batch_id: int) -> bool:
+    if clean(card.get("identity")) != clean(expected.get("identity")) or int(card.get("batch_id") or 0) != batch_id:
+        return False
+    cited = Path(clean(card.get("full_text_path"))).expanduser()
+    wanted = Path(clean(expected.get("full_text_path"))).expanduser()
+    if not cited.is_file() or cited.resolve() != wanted.resolve():
+        return False
+    try:
+        match = _number(card.get("match_score"), label="match_score", maximum=10)
+        transfer = _number(card.get("transferability_score"), label="transferability_score", maximum=10)
+        total = _number(card.get("final_score"), label="final_score", maximum=20)
+    except ValueError:
+        return False
+    if abs(round(match + transfer, 4) - total) > 0.01:
+        return False
+    return all(card.get(key) for key in ("title", "summary", "decisive_evidence", "limitations", "borrowable_elements", "confidence"))
+
+
+def _fast_reading_authorized(directory: Path, plan: dict[str, Any]) -> bool:
+    workflow = plan.get("workflow") if isinstance(plan.get("workflow"), dict) else {}
+    planned = (
+        clean(workflow.get("reading_preference")).lower() == "codex_fast"
+        and (workflow.get("user_disabled_claude") is True or workflow.get("claude_unavailable") is True)
+    )
+    observed = read_json(directory / "claude_read_results.json", {}).get("status") == "claude_unavailable"
+    return planned or observed
+
+
+def finalize(run_dir: Path, evidence_path: Path, target: int | None) -> dict[str, Any]:
+    directory = require_run(run_dir)
+    plan = read_json(directory / "plan.json", {})
+    _require_plan_unchanged(directory, plan)
+    if clean((plan.get("workflow") or {}).get("stop_after")).lower() != "recommendation":
+        raise ValueError("This run was not planned for recommendation; do not execute final ranking on an intermediate workflow")
     metadata = read_json(directory / "metadata.json", {})
     shortlist = read_json(directory / "shortlist.json", {})
     read_artifacts = read_json(directory / "read_artifacts.json", {})
     fast_batches = read_json(directory / "codex_fast_batches.json", {})
     reading_mode = read_json(directory / "reading_mode.json", {}).get("mode")
     fast_mode = reading_mode == "codex_fast_three_batches" and isinstance(fast_batches, dict) and fast_batches.get("status") == "ready" and fast_batches.get("reading_mode") == "codex_fast_three_batches"
+    if fast_mode and not _fast_reading_authorized(directory, plan):
+        raise ValueError("Codex fast-reading artifacts lack an explicit or observed Claude-unavailable authorization")
     if not fast_mode and (not isinstance(read_artifacts, dict) or read_artifacts.get("status") != "complete" or read_artifacts.get("read_contract_version") != READ_CONTRACT_VERSION):
         raise ValueError("Default Claude mode requires one validated single-paper read.md per acquired paper")
     reads = {clean(item.get("identity")): item for item in read_artifacts.get("items") or [] if isinstance(item, dict)}
@@ -191,6 +320,12 @@ def finalize(run_dir: Path, evidence_path: Path, target: int) -> dict[str, Any]:
         for item in batch.get("items") or [] if isinstance(item, dict)
     } if fast_mode else {}
     fulltext = read_json(directory / "full_text_results.json", {})
+    fulltext_fingerprint = stable_hash(fulltext)
+    if fast_mode:
+        if fast_batches.get("fulltext_results_fingerprint") != fulltext_fingerprint:
+            raise ValueError("Codex fast-reading batches are stale because full-text results changed")
+    elif read_artifacts.get("fulltext_results_fingerprint") != fulltext_fingerprint:
+        raise ValueError("Validated single-paper reads are stale because full-text results changed")
     metadata_fingerprint = metadata.get("metadata_fingerprint")
     if metadata_fingerprint and (shortlist.get("metadata_fingerprint") != metadata_fingerprint or fulltext.get("metadata_fingerprint") != metadata_fingerprint or fulltext.get("shortlist_fingerprint") != stable_hash(shortlist)):
         raise ValueError("Downstream artifacts are stale because metadata or shortlist changed; rerun from shortlist/fulltext")
@@ -198,6 +333,8 @@ def finalize(run_dir: Path, evidence_path: Path, target: int) -> dict[str, Any]:
     if not isinstance(items, list):
         raise ValueError("full_text_results.json is missing")
     ready = {clean(item.get("identity")): item for item in items if isinstance(item, dict) and item.get("full_text_available") is True}
+    if not ready:
+        raise ValueError("No successfully acquired full texts are available for reading or recommendation")
     cards = _jsonl(evidence_path)
     validated: dict[str, dict[str, Any]] = {}
     for index, card in enumerate(cards):
@@ -233,7 +370,14 @@ def finalize(run_dir: Path, evidence_path: Path, target: int) -> dict[str, Any]:
     if missing:
         raise ValueError(f"Codex must deep-read every acquired full text; missing evidence cards={len(missing)}")
     ordered = sorted(validated.values(), key=lambda item: (-item["final_score"], item["identity"]))
-    target_count = max(1, int(target or 20))
+    if not ordered:
+        raise ValueError("No validated evidence cards are available for final ranking")
+    planned_target = (plan.get("workflow") or {}).get("final_target")
+    if target is not None and planned_target is not None and int(target) != int(planned_target):
+        raise ValueError("--target conflicts with workflow.final_target")
+    target_count = int(target if target is not None else planned_target or 20)
+    if target_count < 1:
+        raise ValueError("final target must be a positive integer")
     payload = {
         "schema_version": 1,
         "run_id": directory.name,
@@ -248,6 +392,7 @@ def finalize(run_dir: Path, evidence_path: Path, target: int) -> dict[str, Any]:
         "generated_at": now_iso(),
         "metadata_fingerprint": metadata.get("metadata_fingerprint"),
         "shortlist_fingerprint": stable_hash(shortlist),
+        "fulltext_results_fingerprint": fulltext_fingerprint,
     }
     write_json(directory / "evidence_cards.validated.json", {"schema_version": 1, "cards": ordered})
     write_json(directory / "final_ranking.json", payload)
@@ -256,7 +401,11 @@ def finalize(run_dir: Path, evidence_path: Path, target: int) -> dict[str, Any]:
 
 
 def complete(run_dir: Path, recommendations_path: Path) -> dict[str, Any]:
-    directory = ensure_run(run_dir)
+    directory = require_run(run_dir)
+    plan = read_json(directory / "plan.json", {})
+    _require_plan_unchanged(directory, plan)
+    if clean((plan.get("workflow") or {}).get("stop_after")).lower() != "recommendation":
+        raise ValueError("This run was not planned to finish at recommendation; create or update the proper active run plan")
     ranking = read_json(directory / "final_ranking.json", {})
     aggregate_reads = directory / "read.md"
     if ranking.get("reading_mode") != "codex_fast_three_batches" and (not aggregate_reads.is_file() or len(aggregate_reads.read_text(encoding="utf-8").strip()) < 200):
@@ -265,8 +414,13 @@ def complete(run_dir: Path, recommendations_path: Path) -> dict[str, Any]:
         raise ValueError("final_ranking.json uses a stale reading contract; regenerate all per-paper reads and ranking")
     metadata = read_json(directory / "metadata.json", {})
     shortlist = read_json(directory / "shortlist.json", {})
+    fulltext = read_json(directory / "full_text_results.json", {})
     metadata_fingerprint = metadata.get("metadata_fingerprint")
-    if metadata_fingerprint and (ranking.get("metadata_fingerprint") != metadata_fingerprint or ranking.get("shortlist_fingerprint") != stable_hash(shortlist)):
+    if metadata_fingerprint and (
+        ranking.get("metadata_fingerprint") != metadata_fingerprint
+        or ranking.get("shortlist_fingerprint") != stable_hash(shortlist)
+        or ranking.get("fulltext_results_fingerprint") != stable_hash(fulltext)
+    ):
         raise ValueError("final_ranking.json is stale because upstream metadata changed; rerun downstream stages")
     recommendations = ranking.get("recommendations") if isinstance(ranking, dict) else None
     if not isinstance(recommendations, list) or not recommendations:
@@ -285,32 +439,74 @@ def complete(run_dir: Path, recommendations_path: Path) -> dict[str, Any]:
 
 
 def finish_stage(run_dir: Path, stage: str) -> dict[str, Any]:
-    directory = ensure_run(run_dir)
+    directory = require_run(run_dir)
     stage_name = clean(stage).lower()
+    plan = read_json(directory / "plan.json", {})
+    _require_plan_unchanged(directory, plan)
+    planned_stop = clean((plan.get("workflow") or {}).get("stop_after")).lower()
+    if planned_stop != stage_name:
+        raise ValueError(f"Plan stop_after is {planned_stop or 'missing'}, not {stage_name}; do not mark an intermediate stage complete")
     if stage_name == "metadata":
         artifact = read_json(directory / "metadata.json", {})
         count = len(artifact.get("papers") or [])
-        valid = artifact.get("status") in {"complete", "complete_with_gaps"} and count > 0
+        valid = artifact.get("status") == "complete" and count > 0
     elif stage_name == "shortlist":
         artifact = read_json(directory / "shortlist.json", {})
+        metadata = read_json(directory / "metadata.json", {})
         count = len(artifact.get("papers") or [])
-        valid = count > 0
+        valid = metadata.get("status") == "complete" and count > 0 and artifact.get("metadata_fingerprint") == metadata.get("metadata_fingerprint")
     elif stage_name == "fulltext":
         artifact = read_json(directory / "full_text_results.json", {})
+        metadata = read_json(directory / "metadata.json", {})
+        shortlist = read_json(directory / "shortlist.json", {})
         count = sum(item.get("full_text_available") is True for item in artifact.get("items") or [] if isinstance(item, dict))
-        valid = isinstance(artifact.get("items"), list)
+        valid = (
+            artifact.get("status") in {"complete", "complete_with_gaps"}
+            and count > 0
+            and artifact.get("metadata_fingerprint") == metadata.get("metadata_fingerprint")
+            and artifact.get("shortlist_fingerprint") == stable_hash(shortlist)
+        )
     elif stage_name == "reading":
         artifact = read_json(directory / "read_artifacts.json", {})
         if read_json(directory / "reading_mode.json", {}).get("mode") == "codex_fast_three_batches":
-            batches = read_json(directory / "codex_fast_batches.json", {}).get("batches") or []
+            fast_payload = read_json(directory / "codex_fast_batches.json", {})
+            batches = fast_payload.get("batches") or []
             results = [read_json(Path(clean(batch.get("result_path"))), None) for batch in batches if isinstance(batch, dict)]
             count = sum(len(result) for result in results if isinstance(result, list))
-            expected = {clean(item.get("identity")) for batch in batches if isinstance(batch, dict) for item in batch.get("items") or [] if isinstance(item, dict)}
-            actual = {clean(item.get("identity")) for result in results if isinstance(result, list) for item in result if isinstance(item, dict)}
-            valid = len(results) == 3 and all(isinstance(result, list) for result in results) and actual == expected
+            expected_items = {
+                clean(item.get("identity")): (int(batch.get("batch_id") or 0), item)
+                for batch in batches if isinstance(batch, dict)
+                for item in batch.get("items") or [] if isinstance(item, dict)
+            }
+            flat = [item for result in results if isinstance(result, list) for item in result if isinstance(item, dict)]
+            actual_ids = [clean(item.get("identity")) for item in flat]
+            fulltext = read_json(directory / "full_text_results.json", {})
+            cards_valid = all(
+                identity in expected_items and _fast_card_valid(card, expected_items[identity][1], expected_items[identity][0])
+                for card in flat for identity in [clean(card.get("identity"))]
+            )
+            valid = (
+                _fast_reading_authorized(directory, plan)
+                and fast_payload.get("authorization") in {"user_disabled_claude", "plan_claude_unavailable", "observed_claude_unavailable"}
+                and bool(expected_items)
+                and count == len(expected_items)
+                and len(actual_ids) == len(set(actual_ids))
+                and len(results) == 3
+                and all(isinstance(result, list) for result in results)
+                and set(actual_ids) == set(expected_items)
+                and cards_valid
+                and fast_payload.get("fulltext_results_fingerprint") == stable_hash(fulltext)
+            )
         else:
             count = int(artifact.get("validated_count") or 0)
-            valid = artifact.get("status") == "complete"
+            fulltext = read_json(directory / "full_text_results.json", {})
+            valid = (
+                read_json(directory / "reading_mode.json", {}).get("mode") == "external_claude_per_paper"
+                and clean((plan.get("workflow") or {}).get("reading_preference")).lower() != "codex_fast"
+                and artifact.get("status") == "complete"
+                and count > 0
+                and artifact.get("fulltext_results_fingerprint") == stable_hash(fulltext)
+            )
     else:
         raise ValueError("finish-stage supports metadata, shortlist, fulltext, or reading")
     if not valid:

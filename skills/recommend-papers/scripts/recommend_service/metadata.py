@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 
 from .credentials import openreview_settings
 from .http import ServiceRequestDeferred, bounded_request_policy, get, receipt, service_call
-from .storage import DATA_ROOT, METADATA_CACHE_ROOT, now_iso, read_json, stable_hash, update_run, write_json
+from .storage import DATA_ROOT, METADATA_CACHE_ROOT, now_iso, read_json, require_run, stable_hash, update_run, write_json
 from .venue_sources import fetch_official_venue
 
 
@@ -950,6 +950,10 @@ def validate_plan(plan: Any) -> dict[str, Any]:
     request_scope = plan.get("request_scope")
     if not isinstance(request_scope, dict) or not isinstance(request_scope.get("user_specified_time"), bool) or not isinstance(request_scope.get("user_specified_channels"), bool):
         raise ValueError("Plan requires request_scope with boolean user_specified_time and user_specified_channels")
+    as_of = date_text(request_scope.get("as_of_date"))
+    if not as_of:
+        raise ValueError("Plan requires request_scope.as_of_date as a concrete ISO date")
+    request_scope["as_of_date"] = as_of
     workflow = _validated_workflow(plan, request_scope)
     plan["workflow"] = workflow
     decisions = plan.get("channel_decisions")
@@ -1345,7 +1349,7 @@ def probe_venue(
                 attempts.append({"year": year, "adapter": adapter, "status": "available" if rows else "empty", "count": len(rows), "details": source_receipt})
                 if rows:
                     result = {
-                        "status": "available",
+                        "status": "probe_available",
                         "requested_year": start_year,
                         "resolved_year": year,
                         "year_fallback": year != start_year,
@@ -1407,11 +1411,20 @@ def probe_venue(
             "probe_only": True,
             "formal_metadata_required": True,
         }
+    diagnostic_samples = list(result.pop("samples", []) or [])
+    result.update({
+        "artifact_role": "venue_year_diagnostic_only",
+        "research_output": False,
+        "complete_catalog": False,
+        "observed_sample_count": len(diagnostic_samples),
+        "next_required_stage": "metadata",
+        "message": "Diagnostic year/channel probe only. No papers from this response may be reported as research results; run formal metadata acquisition next.",
+    })
     if run_dir is not None:
-        run_dir = run_dir.expanduser().resolve()
+        run_dir = require_run(run_dir)
         venue_key = re.sub(r"[^a-z0-9_.-]+", "_", clean(spec.get("venue_id") or spec.get("venue") or "venue").lower())
         receipt_path = run_dir / "venue_probes" / f"{venue_key}-{start_year}.json"
-        payload = {"schema_version": 1, "created_at": now_iso(), "source": spec, **result}
+        payload = {"schema_version": 1, "created_at": now_iso(), "source": spec, **result, "diagnostic_samples": diagnostic_samples}
         write_json(receipt_path, payload)
         state = read_json(run_dir / "run.json", {})
         counts = dict(state.get("counts") or {}) if isinstance(state, dict) else {}

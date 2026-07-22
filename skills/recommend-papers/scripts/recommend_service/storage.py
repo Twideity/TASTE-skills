@@ -153,40 +153,40 @@ def create_run() -> Path:
     return run_dir
 
 
-def ensure_run(path: Path | None) -> Path:
-    if path is None:
-        return create_run()
+def require_run(path: Path, *, mutable: bool = True) -> Path:
+    """Resolve an existing run; downstream commands must never create one by typo."""
     run_dir = safe_write_target(path)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    if not (run_dir / "run.json").exists():
-        write_json(run_dir / "run.json", {
-            "schema_version": 1,
-            "run_id": run_dir.name,
-            "created_at": now_iso(),
-            "updated_at": now_iso(),
-            "stage": "initialized",
-            "status": "active",
-            "counts": {},
-            "warnings": [],
-        })
+    state = read_json(run_dir / "run.json", None)
+    if not isinstance(state, dict) or clean_run_id(state.get("run_id")) != run_dir.name:
+        raise ValueError(f"run-dir is not an initialized recommend-papers run: {run_dir}")
+    if mutable and state.get("status") == "complete":
+        raise ValueError(f"Run is complete and immutable; create a child run instead: {run_dir}")
     return run_dir
+
+
+def clean_run_id(value: Any) -> str:
+    return str(value or "").strip()
 
 
 def update_run(run_dir: Path, *, stage: str, status: str = "active", counts: dict[str, int] | None = None, warnings: list[str] | None = None) -> dict[str, Any]:
     path = run_dir / "run.json"
-    state = read_json(path, {})
-    if not isinstance(state, dict):
-        state = {}
-    state.update({
-        "schema_version": 1,
-        "run_id": run_dir.name,
-        "updated_at": now_iso(),
-        "stage": stage,
-        "status": status,
-    })
-    if counts is not None:
-        state["counts"] = counts
-    if warnings is not None:
-        state["warnings"] = warnings
-    write_json(path, state)
+    lock_path = safe_write_target(run_dir / ".run-state.lock")
+    with FileLock(str(lock_path)):
+        state = read_json(path, {})
+        if not isinstance(state, dict):
+            state = {}
+        state.update({
+            "schema_version": 1,
+            "run_id": run_dir.name,
+            "updated_at": now_iso(),
+            "stage": stage,
+            "status": status,
+        })
+        if counts is not None:
+            merged_counts = dict(state.get("counts") or {})
+            merged_counts.update(counts)
+            state["counts"] = merged_counts
+        if warnings is not None:
+            state["warnings"] = warnings
+        write_json(path, state)
     return state

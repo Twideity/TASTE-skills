@@ -114,7 +114,7 @@ Defaults are fallbacks rather than minimums. Each turn may independently customi
 - Metadata shortlist for full-text acquisition and deep reading: 100 papers.
 - Final recommendations: 20 papers.
 - Conferences: the latest single year with complete usable metadata for NeurIPS, ICLR, and ICML.
-- Built-in conference coverage also includes SIGKDD/KDD, SIGIR, CIKM, AAAI, ICCV, WWW, CVPR, ACL, IJCAI, ECCV, and EMNLP. Conference metadata uses the corresponding official live channel and is accepted only when the complete title-and-abstract corpus is verified. The run-aware year probe is lightweight: it fetches and enriches only the requested sample through each configured live route, persists a receipt, and never launches the formal full-catalog crawl. A transient error leaves the requested year unresolved rather than selecting an older edition. After a year is resolved, formal acquisition still crawls the complete catalog; ACM-family enrichment keeps per-paper checkpoints and reuses exact-title local arXiv metadata before bounded remote fallbacks.
+- Built-in conference coverage also includes SIGKDD/KDD, SIGIR, CIKM, AAAI, ICCV, WWW, CVPR, ACL, IJCAI, ECCV, and EMNLP. Conference metadata uses the corresponding official live channel and is accepted only when the complete title-and-abstract corpus is verified. The run-aware year probe is lightweight: its three records are receipt-only diagnostics and never research output. After a matching same-run probe resolves the year, formal acquisition still independently crawls the complete catalog. A transient error leaves the requested year unresolved rather than selecting an older edition; ACM-family enrichment keeps per-paper checkpoints and reuses exact-title local arXiv metadata before bounded remote fallbacks.
 - arXiv: the trailing six calendar months, inclusive, across `cs.AI`, `cs.LG`, `stat.ML`, `cs.CL`, `cs.CV`, `cs.IR`, `cs.RO`, `eess.SY`, `cs.MA`, and `cs.NE` unless the user explicitly supplies categories.
 - Topic-adaptive sources: one to three additional sources selected by Codex.
 - Full-text download workers: 8 globally. Different APIs and official hosts run concurrently; every channel has its own concurrency slots, request interval, and cooldown. Same-channel capacity is source-specific and can be overridden with `RECOMMEND_PAPERS_HTTP_CONCURRENCY`. DBLP defaults to one slot and rotates among its three official mirrors on network/5xx failures; a long `Retry-After` is deferred instead of freezing the run. OpenReview defaults to one shared slot and cannot exceed three; official-client login/API/attachment and direct PDF/HTML requests share this gate. A worker cannot wait indefinitely for a cooldown or occupied cross-process slot. Papers deferred by 429/403/challenge are labeled temporary, then retried once through a single recovery worker after the shared cooldown instead of being reported as having no PDF. ECCV archive and virtual-page routes derive the official main PDF while excluding supplements, posters, and slides.
@@ -345,7 +345,7 @@ PowerShell中使用`& $python $service cache-status`。
 - 进入全文下载和精读的元数据前100篇。
 - 最终推荐前20篇。
 - 会议为最新完整可用年份的 NeurIPS、ICLR、ICML。
-- 内置会议还包括 SIGKDD/KDD、SIGIR、CIKM、AAAI、ICCV、WWW、CVPR、ACL、IJCAI、ECCV、EMNLP；分别使用对应官方实时渠道，只有完整标题与摘要全集通过验证后才会写入年度缓存。年份探测会关联当前 run，只抓取并补全指定数量的样本、保存探测收据，绝不会暗中启动正式全量抓取；任一渠道发生临时限流或网络故障时，该年份保持“暂未解析”，不会被误判为不存在并回退旧年份。年份确定后，正式流程仍抓取完整论文集；ACM 系会议按论文保存断点，并优先复用本地 arXiv 精确标题元数据，再执行有等待上限的远程补全。
+- 内置会议还包括 SIGKDD/KDD、SIGIR、CIKM、AAAI、ICCV、WWW、CVPR、ACL、IJCAI、ECCV、EMNLP；分别使用对应官方实时渠道，只有完整标题与摘要全集通过验证后才会写入年度缓存。年份探针固定最多抽取3篇，仅用于判断实际渠道与年份是否可访问；样本只保存在收据的`diagnostic_samples`中，命令输出不返回论文，且绝不能用于回答、推荐或代替正式元数据。正式抓取必须先有当前run匹配的成功探针收据，然后仍独立抓取完整论文集。任一渠道发生临时限流或网络故障时，该年份保持“暂未解析”，不会被误判为不存在并回退旧年份；ACM系会议按论文保存断点，并优先复用本地arXiv精确标题元数据，再执行有等待上限的远程补全。
 - arXiv 为最近六个日历月，默认分类包括 `cs.AI`、`cs.LG`、`stat.ML`、`cs.CL`、`cs.CV`、`cs.IR`、`cs.RO`、`eess.SY`、`cs.MA`、`cs.NE`。
 - Codex根据主题增加1–3个渠道。
 - 全文下载默认全局8个worker；不同API和官方主机可同时运行，各渠道独立限制并发、请求间隔和冷却。同渠道容量按来源配置，也可通过 `RECOMMEND_PAPERS_HTTP_CONCURRENCY` 覆盖。DBLP默认1个槽位，网络错误或5xx时会在三个官方镜像间切换；过长的 `Retry-After` 会延期而不是卡住整次运行。OpenReview默认只使用1个共享槽位，且无论如何不超过3；官方client登录/API/附件与PDF/HTML直链共用同一门控和冷却。单个worker不会无限等待冷却或被占用的跨进程槽位。因429、403或challenge延期的论文会标记为暂时失败，并在冷却后由1个恢复worker自动重试一次，不会被表述为“没有PDF”。ECCV归档页和virtual页可定位官方主PDF，并排除supplement、poster与slides。
@@ -373,8 +373,8 @@ PowerShell中使用`& $python $service cache-status`。
 1. `doctor` 检查Python版本、依赖、外部存储路径、OpenReview访问模式和后端健康状态。
 2. `migrate-metadata-cache` 统一缓存布局并删除旧式或没有完整性证明的缓存。
 3. `init-run` 在XDG state目录创建一个持久任务；追问可传入父任务、研究模式和新问题。
-4. Codex理解研究要求，确定日期、主题和渠道，并写入 `plan.json`。
-5. `metadata` 全量抓取或复用各来源元数据，生成逐来源回执和 `metadata.json`。
+4. Codex理解研究要求，确定日期、主题和渠道；对每个会议执行关联当前run的`probe-venue`，再把实际解析年份写入`plan.json`。
+5. `metadata` 要求匹配的成功探针收据，并全量抓取或复用各来源元数据，生成逐来源回执和 `metadata.json`。
 6. Codex仅根据标题和摘要为所有论文评分；`shortlist` 验证评分覆盖率并默认选择前100篇。
 7. `fulltext` 获取并验证候选全文，保证fallback过程中的论文身份一致，并缓存成功产物。
 8. 默认执行 `prepare-reads` 和 `claude-reads`；后者使用最多16个并发槽位流水执行，每完成一篇就启动下一篇，逐篇写中文 `read.md` 和哈希绑定回执。
