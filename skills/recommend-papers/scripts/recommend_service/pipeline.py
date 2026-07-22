@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import random
+import secrets
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -57,8 +61,16 @@ def run_metadata(plan_path: Path, run_dir: Path | None = None) -> dict[str, Any]
 
 
 def _venue_key(value: Any) -> str:
-    key = clean(value).lower()
-    return {"sigkdd": "kdd", "nips": "neurips", "thewebconference": "www", "webconf": "www"}.get(key, key)
+    key = "".join(character for character in clean(value).lower() if character.isalnum())
+    aliases = {
+        "sigkdd": "kdd",
+        "nips": "neurips",
+        "thewebconference": "www",
+        "thewebconf": "www",
+        "webconference": "www",
+        "webconf": "www",
+    }
+    return aliases.get(key, key)
 
 
 def _require_venue_probe_receipts(plan: dict[str, Any], directory: Path) -> list[dict[str, Any]]:
@@ -122,26 +134,46 @@ def _run_metadata_locked(plan_path: Path, directory: Path) -> dict[str, Any]:
         raise ValueError("cache_policy must be reuse, refresh, or only")
     max_age_days = _number(plan.get("metadata_cache_max_age_days", 7), label="metadata_cache_max_age_days", maximum=3650)
     all_rows: list[dict[str, Any]] = []
-    receipts: list[dict[str, Any]] = []
+    receipts_by_index: dict[int, dict[str, Any]] = {}
+    papers_by_index: dict[int, list[dict[str, Any]]] = {}
     warnings: list[str] = []
     sources = plan["sources"]
     update_run(directory, stage="metadata_crawl", counts={"sources": len(sources), "completed_sources": 0, "raw_papers": 0})
     receipt_dir = directory / "source_receipts"
-    for index, spec in enumerate(sources, 1):
+
+    def fetch_one(index: int, spec: dict[str, Any]) -> tuple[int, list[dict[str, Any]], dict[str, Any], str]:
         try:
             papers, source_receipt = fetch_source(spec, policy=policy, max_age_days=max_age_days)
-            all_rows.extend(papers)
             details = source_receipt.get("details") if isinstance(source_receipt, dict) else None
             coverage_status = details.get("status") if isinstance(details, dict) else "complete"
             row = {"index": index, "source": spec, "status": coverage_status, "paper_count": len(papers), "cache": source_receipt}
-            if coverage_status != "complete":
-                warnings.append(f"Source {index} coverage is {coverage_status}; inspect receipt and repair before scoring")
+            warning = f"Source {index} coverage is {coverage_status}; inspect receipt and repair before scoring" if coverage_status != "complete" else ""
         except Exception as exc:
+            papers = []
             row = {"index": index, "source": spec, "status": "error", "paper_count": 0, "error_type": type(exc).__name__, "message": str(exc)[:1000]}
-            warnings.append(f"Source {index} failed: {type(exc).__name__}: {str(exc)[:200]}")
-        receipts.append(row)
-        write_json(receipt_dir / f"{index:03d}.json", row)
-        update_run(directory, stage="metadata_crawl", counts={"sources": len(sources), "completed_sources": index, "raw_papers": len(all_rows)}, warnings=warnings)
+            warning = f"Source {index} failed: {type(exc).__name__}: {str(exc)[:200]}"
+        return index, papers, row, warning
+
+    try:
+        source_workers = max(1, min(8, int(os.environ.get("RECOMMEND_PAPERS_METADATA_SOURCE_WORKERS", "6") or 6), len(sources)))
+    except (TypeError, ValueError):
+        source_workers = min(6, len(sources))
+    completed_sources = 0
+    with ThreadPoolExecutor(max_workers=source_workers) as pool:
+        futures = {pool.submit(fetch_one, index, spec): index for index, spec in enumerate(sources, 1)}
+        for future in as_completed(futures):
+            index, papers, row, warning = future.result()
+            papers_by_index[index] = papers
+            receipts_by_index[index] = row
+            if warning:
+                warnings.append(warning)
+                warnings.sort()
+            write_json(receipt_dir / f"{index:03d}.json", row)
+            completed_sources += 1
+            raw_count = sum(len(items) for items in papers_by_index.values())
+            update_run(directory, stage="metadata_crawl", counts={"sources": len(sources), "completed_sources": completed_sources, "raw_papers": raw_count, "metadata_source_workers": source_workers}, warnings=warnings)
+    receipts = [receipts_by_index[index] for index in range(1, len(sources) + 1)]
+    all_rows = [paper for index in range(1, len(sources) + 1) for paper in papers_by_index.get(index, [])]
     papers = deduplicate(all_rows)
     status = "complete" if papers and not warnings else "complete_with_gaps" if papers else "blocked"
     payload = {
@@ -231,6 +263,185 @@ def build_shortlist(run_dir: Path, scores_path: Path, target: int | None) -> dic
     }
     write_json(directory / "shortlist.json", payload)
     update_run(directory, stage="shortlist_ready", counts={"metadata_papers": len(papers), "metadata_scored": len(ordered), "shortlist_target": target_count, "shortlist_actual": len(shortlist_papers)})
+    return payload
+
+
+def build_random_venue_shortlist(run_dir: Path, per_venue: int, seed: int | None = None) -> dict[str, Any]:
+    """Select an auditable uniform sample independently within every planned venue."""
+    directory = require_run(run_dir)
+    plan = _require_stage_allowed(directory, "shortlist")
+    _require_plan_unchanged(directory, plan)
+    metadata = read_json(directory / "metadata.json", {})
+    papers = metadata.get("papers") if isinstance(metadata, dict) else None
+    if not isinstance(papers, list) or not papers:
+        raise ValueError("metadata.json is missing or empty")
+    if metadata.get("status") != "complete":
+        raise ValueError("metadata coverage is incomplete; repair all source receipts before random sampling")
+    if per_venue < 1:
+        raise ValueError("--per-venue must be a positive integer")
+
+    venue_sources: list[tuple[str, int]] = []
+    for index, source in enumerate(plan.get("sources") or []):
+        if clean(source.get("type")).lower() != "venue":
+            raise ValueError("random-venue-shortlist supports venue-only plans")
+        venue = _venue_key(source.get("venue_id") or source.get("venue"))
+        years = source.get("years") or []
+        if not venue or len(years) != 1:
+            raise ValueError(f"sources[{index}] must identify exactly one venue and year")
+        key = (venue, int(years[0]))
+        if key in venue_sources:
+            raise ValueError(f"Duplicate planned venue/year: {venue} {years[0]}")
+        venue_sources.append(key)
+
+    candidates: dict[tuple[str, int], list[dict[str, Any]]] = {key: [] for key in venue_sources}
+    for paper in papers:
+        if not isinstance(paper, dict):
+            continue
+        try:
+            key = (_venue_key(paper.get("venue")), int(paper.get("year") or 0))
+        except (TypeError, ValueError):
+            continue
+        if key in candidates:
+            candidates[key].append(paper)
+    short = {f"{venue}:{year}": len(rows) for (venue, year), rows in candidates.items() if len(rows) < per_venue}
+    if short:
+        raise ValueError(f"Not enough metadata papers for per-venue sampling: {short}")
+
+    actual_seed = int(seed if seed is not None else secrets.randbits(64))
+    generator = random.Random(actual_seed)
+    selected: list[dict[str, Any]] = []
+    strata: list[dict[str, Any]] = []
+    for venue, year in venue_sources:
+        population = sorted(candidates[(venue, year)], key=paper_identity)
+        sample = generator.sample(population, per_venue)
+        selected.extend(sample)
+        strata.append({
+            "venue": venue,
+            "year": year,
+            "population_count": len(population),
+            "sample_count": len(sample),
+            "identities": [paper_identity(item) for item in sample],
+        })
+
+    target_count = per_venue * len(venue_sources)
+    planned_target = (plan.get("workflow") or {}).get("shortlist_target")
+    if planned_target is not None and int(planned_target) != target_count:
+        raise ValueError(
+            f"Random venue sample size {target_count} conflicts with workflow.shortlist_target={planned_target}"
+        )
+    payload = {
+        "schema_version": 1,
+        "run_id": directory.name,
+        "status": "complete",
+        "selection_method": "uniform_random_without_replacement_stratified_by_venue",
+        "seed": actual_seed,
+        "per_venue": per_venue,
+        "target_count": target_count,
+        "actual_count": len(selected),
+        "shortfall": 0,
+        "strata": strata,
+        "papers": selected,
+        "metadata_fingerprint": metadata.get("metadata_fingerprint"),
+        "generated_at": now_iso(),
+    }
+    write_json(directory / "shortlist.json", payload)
+    update_run(directory, stage="shortlist_ready", counts={
+        "metadata_papers": len(papers),
+        "shortlist_target": target_count,
+        "shortlist_actual": len(selected),
+        "shortlist_venues": len(venue_sources),
+        "shortlist_per_venue": per_venue,
+    })
+    return payload
+
+
+def replace_failed_random_venue_papers(run_dir: Path) -> dict[str, Any]:
+    """Keep acquired papers and draw same-venue replacements for failed random picks."""
+    directory = require_run(run_dir)
+    plan = _require_stage_allowed(directory, "fulltext")
+    _require_plan_unchanged(directory, plan)
+    shortlist = read_json(directory / "shortlist.json", {})
+    fulltext = read_json(directory / "full_text_results.json", {})
+    metadata = read_json(directory / "metadata.json", {})
+    if shortlist.get("selection_method") != "uniform_random_without_replacement_stratified_by_venue":
+        raise ValueError("replace-failed-random-venue requires a random venue shortlist")
+    if fulltext.get("shortlist_fingerprint") != stable_hash(shortlist):
+        raise ValueError("full_text_results.json is stale for the current shortlist")
+    items = fulltext.get("items") if isinstance(fulltext.get("items"), list) else []
+    if not items:
+        raise ValueError("full_text_results.json has no acquisition results")
+    per_venue = int(shortlist.get("per_venue") or 0)
+    seed = int(shortlist.get("seed"))
+    replacement_round = int(shortlist.get("replacement_round") or 0) + 1
+    ready = {
+        paper_identity(item.get("paper") or {}): item.get("paper")
+        for item in items
+        if isinstance(item, dict) and item.get("full_text_available") is True and isinstance(item.get("paper"), dict)
+    }
+    attempted = set(clean(value) for value in shortlist.get("attempted_identities") or [])
+    attempted.update(paper_identity(item) for item in shortlist.get("papers") or [] if isinstance(item, dict))
+    metadata_papers = metadata.get("papers") if isinstance(metadata.get("papers"), list) else []
+    population: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for paper in metadata_papers:
+        if not isinstance(paper, dict):
+            continue
+        try:
+            key = (_venue_key(paper.get("venue")), int(paper.get("year") or 0))
+        except (TypeError, ValueError):
+            continue
+        population.setdefault(key, []).append(paper)
+
+    selected: list[dict[str, Any]] = []
+    strata: list[dict[str, Any]] = []
+    replacement_count = 0
+    for prior in shortlist.get("strata") or []:
+        venue, year = _venue_key(prior.get("venue")), int(prior.get("year") or 0)
+        prior_ids = [clean(value) for value in prior.get("identities") or []]
+        kept = [ready[identity] for identity in prior_ids if identity in ready]
+        needed = per_venue - len(kept)
+        available = sorted(
+            (paper for paper in population.get((venue, year), []) if paper_identity(paper) not in attempted),
+            key=paper_identity,
+        )
+        if len(available) < needed:
+            raise ValueError(
+                f"No untried same-venue replacements remain for {venue} {year}: needed={needed}, available={len(available)}"
+            )
+        generator = random.Random(f"{seed}:{replacement_round}:{venue}:{year}")
+        replacements = generator.sample(available, needed)
+        replacement_count += len(replacements)
+        current = [*kept, *replacements]
+        selected.extend(current)
+        strata.append({
+            "venue": venue,
+            "year": year,
+            "population_count": len(population.get((venue, year), [])),
+            "sample_count": len(current),
+            "kept_ready_count": len(kept),
+            "replacement_count": len(replacements),
+            "identities": [paper_identity(item) for item in current],
+        })
+    if replacement_count == 0:
+        raise ValueError("Every random venue selection already has acquired full text; no replacements are needed")
+    attempted.update(paper_identity(item) for item in selected)
+    payload = {
+        **shortlist,
+        "status": "complete",
+        "replacement_round": replacement_round,
+        "replacement_count": replacement_count,
+        "attempted_identities": sorted(attempted),
+        "strata": strata,
+        "papers": selected,
+        "actual_count": len(selected),
+        "generated_at": now_iso(),
+    }
+    write_json(directory / "shortlist.json", payload)
+    update_run(directory, stage="shortlist_ready", status="active", counts={
+        "shortlist_target": len(selected),
+        "shortlist_actual": len(selected),
+        "random_replacement_round": replacement_round,
+        "random_replacements": replacement_count,
+    }, warnings=[])
     return payload
 
 

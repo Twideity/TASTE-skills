@@ -255,6 +255,40 @@ def _candidate_urls(paper: dict[str, Any], *, include_oa_lookups: bool = True) -
     openreview_id = _identifier(paper, "openreview_id")
     if openreview_id:
         add(f"https://openreview.net/pdf?id={openreview_id}", "openreview_pdf")
+        if include_oa_lookups:
+            try:
+                response = get("https://chatpaper.com/search", params={"keywords": clean(paper.get("title"))}, timeout=20)
+                receipts.append({"kind": "chatpaper_openreview_cache_search", **receipt(response)})
+                article_ids: list[str] = []
+                if response.ok:
+                    for match in re.finditer(r'(?:data-doc=["\']|/(?:zh-CN/)?paper/)(\d+)', response.text, flags=re.I):
+                        if match.group(1) not in article_ids:
+                            article_ids.append(match.group(1))
+                        if len(article_ids) >= 3:
+                            break
+                for article_id in article_ids:
+                    page = get(f"https://chatpaper.com/paper/{article_id}", timeout=20)
+                    note_ids = set(re.findall(r"openreview\.net/(?:forum\?id=|pdf\?id=)([A-Za-z0-9_-]+)", page.text if page.ok else "", flags=re.I))
+                    matched = openreview_id in note_ids
+                    receipts.append({
+                        "kind": "chatpaper_openreview_cache_page",
+                        "article_id": article_id,
+                        "openreview_id_match": matched,
+                        "candidate_note_id_count": len(note_ids),
+                        **receipt(page),
+                    })
+                    if matched:
+                        add(
+                            f"https://chatpaper.com/api/v1/articles/download/{article_id}",
+                            "chatpaper_openreview_cached_pdf_exact_note_id",
+                        )
+            except Exception as exc:
+                receipts.append({
+                    "kind": "chatpaper_openreview_cache_search",
+                    "status": "error",
+                    "error_type": type(exc).__name__,
+                    "message": str(exc)[:500],
+                })
     doi = _identifier(paper, "doi")
     if doi and include_oa_lookups:
         openalex_cooldown = cooldown_remaining("openalex")
@@ -262,7 +296,8 @@ def _candidate_urls(paper: dict[str, Any], *, include_oa_lookups: bool = True) -
             receipts.append({"kind": "openalex_lookup", "status": "skipped_cooldown", "cooldown_remaining_seconds": round(openalex_cooldown, 3)})
         else:
             try:
-                response = get(f"https://api.openalex.org/works/https://doi.org/{quote(doi, safe='')}")
+                with bounded_request_policy(max_attempts=2, max_wait_seconds=5.0, wall_timeout_seconds=30.0):
+                    response = get(f"https://api.openalex.org/works/https://doi.org/{quote(doi, safe='')}")
                 receipts.append({"kind": "openalex_lookup", **receipt(response)})
                 if response.ok:
                     payload = response.json()
@@ -279,7 +314,8 @@ def _candidate_urls(paper: dict[str, Any], *, include_oa_lookups: bool = True) -
                 receipts.append({"kind": "unpaywall_lookup", "status": "skipped_cooldown", "cooldown_remaining_seconds": round(unpaywall_cooldown, 3)})
             else:
                 try:
-                    response = get(f"https://api.unpaywall.org/v2/{quote(doi, safe='')}", params={"email": email})
+                    with bounded_request_policy(max_attempts=2, max_wait_seconds=5.0, wall_timeout_seconds=30.0):
+                        response = get(f"https://api.unpaywall.org/v2/{quote(doi, safe='')}", params={"email": email})
                     receipts.append({"kind": "unpaywall_lookup", **receipt(response)})
                     if response.ok:
                         payload = response.json()
@@ -297,11 +333,12 @@ def _candidate_urls(paper: dict[str, Any], *, include_oa_lookups: bool = True) -
             receipts.append({"kind": "semantic_scholar_title_lookup", "status": "skipped_cooldown", "cooldown_remaining_seconds": round(semantic_cooldown, 3)})
         else:
             try:
-                response = get(
-                    "https://api.semanticscholar.org/graph/v1/paper/search",
-                    params={"query": title, "limit": 5, "fields": "title,openAccessPdf,externalIds"},
-                    timeout=45,
-                )
+                with bounded_request_policy(max_attempts=2, max_wait_seconds=5.0, wall_timeout_seconds=30.0):
+                    response = get(
+                        "https://api.semanticscholar.org/graph/v1/paper/search",
+                        params={"query": title, "limit": 5, "fields": "title,openAccessPdf,externalIds"},
+                        timeout=30,
+                    )
                 receipts.append({"kind": "semantic_scholar_title_lookup", **receipt(response)})
                 if response.ok:
                     for item in response.json().get("data") or []:
@@ -321,11 +358,12 @@ def _candidate_urls(paper: dict[str, Any], *, include_oa_lookups: bool = True) -
             receipts.append({"kind": "hal_title_lookup", "status": "skipped_cooldown", "cooldown_remaining_seconds": round(hal_cooldown, 3)})
         else:
             try:
-                response = get(
-                    "https://api.archives-ouvertes.fr/search/",
-                    params={"q": f'title_t:"{title}"', "fl": "title_s,fileMain_s", "rows": 5, "wt": "json"},
-                    timeout=45,
-                )
+                with bounded_request_policy(max_attempts=2, max_wait_seconds=5.0, wall_timeout_seconds=30.0):
+                    response = get(
+                        "https://api.archives-ouvertes.fr/search/",
+                        params={"q": f'title_t:"{title}"', "fl": "title_s,fileMain_s", "rows": 5, "wt": "json"},
+                        timeout=30,
+                    )
                 receipts.append({"kind": "hal_title_lookup", **receipt(response)})
                 if response.ok:
                     for item in ((response.json().get("response") or {}).get("docs") or []):
@@ -347,11 +385,12 @@ def _candidate_urls(paper: dict[str, Any], *, include_oa_lookups: bool = True) -
             receipts.append({"kind": "arxiv_title_lookup", "status": "skipped_cooldown", "cooldown_remaining_seconds": round(arxiv_cooldown, 3)})
         else:
             try:
-                response = get(
-                    "https://export.arxiv.org/api/query",
-                    params={"search_query": f'ti:"{title}"', "start": 0, "max_results": 5},
-                    timeout=90,
-                )
+                with bounded_request_policy(max_attempts=2, max_wait_seconds=6.0, wall_timeout_seconds=30.0):
+                    response = get(
+                        "https://export.arxiv.org/api/query",
+                        params={"search_query": f'ti:"{title}"', "start": 0, "max_results": 5},
+                        timeout=30,
+                    )
                 receipts.append({"kind": "arxiv_title_lookup", **receipt(response)})
                 if response.ok:
                     namespace = {"a": "http://www.w3.org/2005/Atom"}
@@ -392,6 +431,17 @@ def _download_pdf(paper: dict[str, Any], target_dir: Path) -> tuple[str, Path | 
                 continue
             attempted_urls.add(url)
             attempt: dict[str, Any] = {"kind": candidate["kind"], "url": url}
+            service = service_for(url)
+            remaining = cooldown_remaining(service)
+            if remaining > 0:
+                attempt.update({
+                    "accepted": False,
+                    "status": "skipped_persisted_cooldown",
+                    "service": service,
+                    "cooldown_remaining_seconds": round(remaining, 3),
+                })
+                attempts.append(attempt)
+                continue
             try:
                 response = get(url, timeout=45)
                 attempt.update(receipt(response))
@@ -486,6 +536,18 @@ def _acquire_with_bounded_requests(paper: dict[str, Any], work_dir: Path) -> dic
     if not text:
         for url in (clean(paper.get("url")),):
             if not url.startswith("http"):
+                continue
+            service = "acm" if re.search(r"doi\.org/10\.1145(?:/|%2f)", url, re.I) else service_for(url)
+            remaining = cooldown_remaining(service)
+            if remaining > 0:
+                html_attempts.append({
+                    "kind": "same_paper_html",
+                    "url": url,
+                    "accepted": False,
+                    "status": "skipped_persisted_cooldown",
+                    "service": service,
+                    "cooldown_remaining_seconds": round(remaining, 3),
+                })
                 continue
             try:
                 candidate, attempt = _html_text(url)

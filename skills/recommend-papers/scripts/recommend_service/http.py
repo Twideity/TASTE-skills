@@ -32,6 +32,7 @@ MIN_INTERVALS = {
     "acm": 0.5,
     "semantic_scholar": 0.5,
     "hal": 0.5,
+    "chatpaper": 10.1,
     "generic": 0.25,
 }
 DEFAULT_CONCURRENCY = {
@@ -51,6 +52,7 @@ DEFAULT_CONCURRENCY = {
     "acm": 1,
     "semantic_scholar": 2,
     "hal": 3,
+    "chatpaper": 1,
     "host-aclanthology.org": 6,
     "host-raw.githubusercontent.com": 4,
     "host-openaccess.thecvf.com": 6,
@@ -93,6 +95,8 @@ def service_for(url: str) -> str:
         return "semantic_scholar"
     if "archives-ouvertes.fr" in host:
         return "hal"
+    if host == "chatpaper.com" or host.endswith(".chatpaper.com"):
+        return "chatpaper"
     # Keep cooldowns and cross-process request slots isolated by host.  A 403
     # from one conference site must not stall every other official proceedings
     # host merely because both previously fell into a global "generic" bucket.
@@ -267,8 +271,17 @@ def request_slot(service: str, *, max_wait_seconds: float | None = None) -> Iter
                 if reservation["ready"]:
                     break
                 wait = float(reservation["wait"])
-                service_cap = _positive_float_env("DBLP_MAX_RETRY_AFTER_WAIT_SEC", 10.0) if service == "dblp" else None
-                effective_cap = max_wait_seconds if max_wait_seconds is not None else service_cap
+                service_cap = (
+                    _positive_float_env("DBLP_MAX_RETRY_AFTER_WAIT_SEC", 10.0) if service == "dblp"
+                    else _positive_float_env("ACM_MAX_COOLDOWN_WAIT_SEC", 5.0) if service == "acm"
+                    else None
+                )
+                effective_cap = (
+                    min(float(max_wait_seconds), float(service_cap))
+                    if max_wait_seconds is not None and service_cap is not None
+                    else max_wait_seconds if max_wait_seconds is not None
+                    else service_cap
+                )
                 if effective_cap is not None and wait > effective_cap:
                     raise ServiceRequestDeferred(
                         f"{service} request deferred for persisted cooldown/spacing ({wait:.1f}s remaining; wait budget {effective_cap:.1f}s)"

@@ -14,7 +14,7 @@ from . import __version__
 from .credentials import openreview_settings
 from .claude_reads import claude_status, run_claude_reads
 from .metadata import catalog, clean, metadata_cache_inventory, migrate_metadata_caches, probe_venue
-from .pipeline import build_shortlist, complete, finalize, finish_stage, run_fulltext, run_metadata
+from .pipeline import build_random_venue_shortlist, build_shortlist, complete, finalize, finish_stage, replace_failed_random_venue_papers, run_fulltext, run_metadata
 from .reading_artifacts import prepare_fast_batches, prepare_reads, validate_reads
 from .storage import CACHE_ROOT, RUNS_ROOT, STATE_ROOT, create_run, git_root_for, read_json, require_run, write_json
 
@@ -32,6 +32,8 @@ def _command_exit_code(command: str, result: dict[str, Any]) -> int:
         "init-run": {"initialized"},
         "probe-venue": {"probe_available"},
         "metadata": {"complete"},
+        "random-venue-shortlist": {"complete"},
+        "replace-failed-random-venue": {"complete"},
         "fulltext": {"complete", "complete_with_gaps"},
         "prepare-reads": {"pending", "ready_for_validation"},
         "claude-reads": {"complete"},
@@ -147,6 +149,65 @@ def inspect_run(run_dir: Path) -> dict[str, Any]:
     return {"run_dir": str(root), "state": read_json(root / "run.json", {}), "file_count": len(files), "files": files}
 
 
+def _compact_metadata_result(result: dict[str, Any]) -> dict[str, Any]:
+    run_dir = Path(clean(result.get("run_dir")))
+    receipts = result.get("source_receipts") if isinstance(result.get("source_receipts"), list) else []
+    return {
+        "schema_version": result.get("schema_version"),
+        "run_id": result.get("run_id"),
+        "run_dir": str(run_dir),
+        "status": result.get("status"),
+        "raw_count": result.get("raw_count"),
+        "deduplicated_count": result.get("deduplicated_count"),
+        "metadata_path": str(run_dir / "metadata.json"),
+        "source_receipts": [
+            {
+                "index": row.get("index"),
+                "venue": (row.get("source") or {}).get("venue_id") or (row.get("source") or {}).get("venue"),
+                "year": ((row.get("source") or {}).get("years") or [None])[0],
+                "status": row.get("status"),
+                "paper_count": row.get("paper_count"),
+                "cache_status": (row.get("cache") or {}).get("status"),
+            }
+            for row in receipts if isinstance(row, dict)
+        ],
+        "warnings": result.get("warnings") or [],
+    }
+
+
+def _compact_shortlist_result(result: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+    return {
+        "schema_version": result.get("schema_version"),
+        "run_id": result.get("run_id"),
+        "status": result.get("status") or "complete",
+        "selection_method": result.get("selection_method"),
+        "seed": result.get("seed"),
+        "per_venue": result.get("per_venue"),
+        "target_count": result.get("target_count"),
+        "actual_count": result.get("actual_count"),
+        "replacement_round": result.get("replacement_round"),
+        "replacement_count": result.get("replacement_count"),
+        "strata": [
+            {key: row.get(key) for key in ("venue", "year", "population_count", "sample_count", "kept_ready_count", "replacement_count") if key in row}
+            for row in result.get("strata") or [] if isinstance(row, dict)
+        ],
+        "shortlist_path": str(run_dir / "shortlist.json"),
+    }
+
+
+def _compact_fulltext_result(result: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+    return {
+        "schema_version": result.get("schema_version"),
+        "run_id": result.get("run_id"),
+        "status": result.get("status"),
+        "requested_count": result.get("requested_count"),
+        "full_text_ready_count": result.get("full_text_ready_count"),
+        "worker_count": result.get("worker_count"),
+        "cooldown_requeue": result.get("cooldown_requeue") or {},
+        "full_text_results_path": str(run_dir / "full_text_results.json"),
+    }
+
+
 def _execute(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "doctor":
         return doctor()
@@ -167,11 +228,18 @@ def _execute(args: argparse.Namespace) -> dict[str, Any]:
             args.run_dir,
         )
     if args.command == "metadata":
-        return run_metadata(args.plan.resolve(), args.run_dir)
+        return _compact_metadata_result(run_metadata(args.plan.resolve(), args.run_dir))
     if args.command == "shortlist":
         return build_shortlist(args.run_dir.resolve(), args.scores.resolve(), args.target)
+    if args.command == "random-venue-shortlist":
+        directory = args.run_dir.resolve()
+        return _compact_shortlist_result(build_random_venue_shortlist(directory, args.per_venue, args.seed), directory)
+    if args.command == "replace-failed-random-venue":
+        directory = args.run_dir.resolve()
+        return _compact_shortlist_result(replace_failed_random_venue_papers(directory), directory)
     if args.command == "fulltext":
-        return run_fulltext(args.run_dir.resolve(), args.workers)
+        directory = args.run_dir.resolve()
+        return _compact_fulltext_result(run_fulltext(directory, args.workers), directory)
     if args.command == "prepare-reads":
         return prepare_reads(args.run_dir.resolve())
     if args.command == "claude-reads":
@@ -216,6 +284,12 @@ def main(argv: list[str] | None = None) -> int:
     shortlist.add_argument("--run-dir", type=Path, required=True)
     shortlist.add_argument("--scores", type=Path, required=True)
     shortlist.add_argument("--target", type=int)
+    random_shortlist = sub.add_parser("random-venue-shortlist")
+    random_shortlist.add_argument("--run-dir", type=Path, required=True)
+    random_shortlist.add_argument("--per-venue", type=int, required=True)
+    random_shortlist.add_argument("--seed", type=int)
+    replace_random = sub.add_parser("replace-failed-random-venue")
+    replace_random.add_argument("--run-dir", type=Path, required=True)
     full = sub.add_parser("fulltext")
     full.add_argument("--run-dir", type=Path, required=True)
     full.add_argument("--workers", type=int, default=8)

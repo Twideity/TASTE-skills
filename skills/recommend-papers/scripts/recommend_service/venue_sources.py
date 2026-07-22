@@ -226,6 +226,23 @@ def _finish_rows(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     limit = _probe_limit(spec)
     if not limit:
+        if spec.get("require_complete_abstracts") is False:
+            missing = sum(not clean(row.get("abstract")) for row in rows)
+            if not rows:
+                raise RuntimeError(f"{adapter} full-metadata crawl returned no records")
+            return rows, {
+                "status": "complete",
+                "complete_catalog": True,
+                "exhausted": True,
+                "truncated": False,
+                "exhaustion_proof": proof,
+                "adapter": adapter,
+                "count": len(rows),
+                "abstracts_complete": len(rows) - missing,
+                "missing_abstracts": missing,
+                "abstract_requirement": "not_required_by_explicit_catalog_core_workflow",
+                "requests": requests,
+            }
         return _result(rows, adapter=adapter, requests=requests, proof=proof)
     samples = rows[:limit]
     missing = sum(not clean(row.get("abstract")) for row in samples)
@@ -976,6 +993,26 @@ def fetch_acm_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[st
             if clean(row.get("abstract")):
                 _save_acm_checkpoint(venue_id, year, row)
         _write_acm_progress(venue_id, year, rows, "batch_index_enrichment")
+    if not probe_only and spec.get("require_complete_abstracts") is False:
+        proof = "official_accepted_pool_merged_with_complete_dblp_title_pool" if official_rows else "complete_dblp_title_pool"
+        result_rows, details = _finish_rows(
+            spec,
+            rows,
+            adapter=f"{venue_id}_acm_enriched",
+            requests=requests,
+            proof=proof,
+            discovered_count=discovered_count,
+        )
+        details.update({
+            "official_title_pool_count": len(official_rows),
+            "restored_checkpoints": restored_checkpoints,
+            "checkpoint_mode": "per_paper_resumable",
+            "optional_per_paper_abstract_enrichment": "skipped_for_explicit_catalog_core_workflow",
+        })
+        stage_dir = _acm_stage_dir(venue_id, year)
+        if stage_dir.is_dir():
+            shutil.rmtree(stage_dir)
+        return result_rows, details
     missing_rows = [row for row in rows if not clean(row.get("abstract"))]
     # ACM often challenges automated clients.  Probe serially and stop at the
     # first persisted cooldown so queued workers cannot each wait 60 seconds.

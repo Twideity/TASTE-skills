@@ -58,7 +58,7 @@ DEFAULT_VENUES = [
     {"id": "cvpr", "name": "CVPR", "aliases": [], "adapter": "cvf_openaccess", "query": "CVPR", "require_complete_abstracts": True},
     {"id": "acl", "name": "ACL", "aliases": [], "adapter": "acl_anthology", "query": "ACL", "require_complete_abstracts": True},
     {"id": "ijcai", "name": "IJCAI", "aliases": [], "adapter": "ijcai_proceedings", "query": "IJCAI", "require_complete_abstracts": True},
-    {"id": "eccv", "name": "ECCV", "aliases": [], "adapter": "eccv_virtual", "fallback_adapters": ["openreview"], "openreview_venue_id_template": "thecvf.com/ECCV/{year}/Conference", "query": "ECCV", "require_complete_abstracts": True},
+    {"id": "eccv", "name": "ECCV", "aliases": [], "adapter": "eccv_virtual", "fallback_adapters": ["openreview"], "openreview_venue_id_template": "thecvf.com/ECCV/{year}/Conference", "openreview_venue_value_template": "ECCV {year}", "query": "ECCV", "require_complete_abstracts": True},
     {"id": "emnlp", "name": "EMNLP", "aliases": [], "adapter": "acl_anthology", "query": "EMNLP", "require_complete_abstracts": True},
     {"id": "recomb", "name": "RECOMB", "aliases": [], "adapter": "dblp", "query": "RECOMB"},
     {"id": "ismb", "name": "ISMB", "aliases": [], "adapter": "dblp", "query": "ISMB"},
@@ -617,15 +617,33 @@ def _fetch_venue_exact(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict
     adapter = adapter or clean(merged.get("adapter")).lower() or "dblp"
     merged.setdefault("venue", merged.get("name") or merged.get("query") or venue_id)
     if adapter == "openreview":
-        return fetch_openreview_venue(merged)
+        rows, details = fetch_openreview_venue(merged)
+        minimum_catalog_records = max(1, int(merged.get("minimum_catalog_records") or 1))
+        if len(rows) < minimum_catalog_records:
+            raise RuntimeError(
+                f"OpenReview venue catalog has only {len(rows)} records, below the required "
+                f"minimum_catalog_records={minimum_catalog_records}; pagination exhaustion alone does not prove "
+                "that an early or partially public conference catalog is complete"
+            )
+        return rows, details
     if adapter == "dblp":
         return fetch_dblp_venue(merged)
     if adapter in {"neurips_official", "icml_official", "acm_enriched", "aaai_ojs", "cvf_openaccess", "acl_anthology", "ijcai_proceedings", "eccv_virtual"}:
         rows, details = fetch_official_venue(merged)
         normalized = [normalize(row, "venue") for row in rows]
+        try:
+            minimum_catalog_records = max(1, int(merged.get("minimum_catalog_records") or 1))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("minimum_catalog_records must be a positive integer") from exc
+        if len(normalized) < minimum_catalog_records:
+            raise RuntimeError(
+                f"Official venue catalog has only {len(normalized)} records, below the required "
+                f"minimum_catalog_records={minimum_catalog_records}; pagination exhaustion alone does not prove "
+                "that an early or partially public conference catalog is complete"
+            )
         audit = venue_metadata_audit(
             normalized,
-            require_complete_abstracts=True,
+            require_complete_abstracts=bool(merged.get("require_complete_abstracts", True)),
             require_official_categories=bool(merged.get("require_official_categories")),
         )
         if not audit["metadata_completeness_ok"]:
@@ -707,46 +725,54 @@ def fetch_openreview_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], 
         if not venue_id:
             template = clean(spec.get("openreview_venue_id_template")) or f"{venue_name}.cc/{{year}}/Conference"
             venue_id = template.format(year=year)
-        offset = 0
-        while True:
-            page_limit = min(1000, probe_limit - len(rows)) if probe_limit else 1000
-            if page_limit <= 0:
+        content_queries = [{"venueid": venue_id}]
+        venue_value_template = clean(spec.get("openreview_venue_value_template"))
+        if venue_value_template:
+            content_queries.append({"venue": venue_value_template.format(year=year)})
+        for content_query in content_queries:
+            offset = 0
+            rows_before_query = len(rows)
+            while True:
+                page_limit = min(1000, probe_limit - len(rows)) if probe_limit else 1000
+                if page_limit <= 0:
+                    break
+                notes, retry_errors = service_call(
+                    "openreview",
+                    lambda content_query=content_query, page_limit=page_limit, offset=offset: client.get_notes(content=content_query, limit=page_limit, offset=offset),
+                    max_attempts=5,
+                )
+                notes = notes or []
+                requests_info.append({"venue_id": venue_id, "content_query": content_query, "offset": offset, "limit": page_limit, "count": len(notes), "authenticated": settings["authenticated"], "retry_errors": retry_errors})
+                if not notes:
+                    break
+                for note in notes:
+                    content = note.content if isinstance(note.content, dict) else {}
+                    note_id = clean(note.id)
+                    authors = _openreview_value(content.get("authors")) or []
+                    timestamp = getattr(note, "pdate", None) or getattr(note, "cdate", None)
+                    published = datetime.fromtimestamp(timestamp / 1000, timezone.utc).date().isoformat() if timestamp else f"{year}-01-01"
+                    rows.append({
+                        "title": _openreview_value(content.get("title")),
+                        "abstract": _openreview_value(content.get("abstract")),
+                        "authors": authors if isinstance(authors, list) else clean(authors),
+                        "published": published,
+                        "year": year,
+                        "url": f"https://openreview.net/forum?id={note_id}",
+                        "pdf_url": f"https://openreview.net/pdf?id={note_id}",
+                        "venue": venue_name,
+                        "categories": _openreview_value(content.get("primary_area")) or _openreview_value(content.get("subject_areas")) or [],
+                        "keywords": _openreview_value(content.get("keywords")) or [],
+                        "presentation_type": _openreview_value(content.get("venue")) or "",
+                        "identifiers": {"openreview_id": note_id, "doi": clean(_openreview_value(content.get("doi")))},
+                    })
+                offset += len(notes)
+                if probe_limit and len(rows) >= probe_limit:
+                    break
+                if len(notes) < page_limit:
+                    break
+                time.sleep(2.1)
+            if len(rows) > rows_before_query:
                 break
-            notes, retry_errors = service_call(
-                "openreview",
-                lambda: client.get_notes(content={"venueid": venue_id}, limit=page_limit, offset=offset),
-                max_attempts=5,
-            )
-            notes = notes or []
-            requests_info.append({"venue_id": venue_id, "offset": offset, "limit": page_limit, "count": len(notes), "authenticated": settings["authenticated"], "retry_errors": retry_errors})
-            if not notes:
-                break
-            for note in notes:
-                content = note.content if isinstance(note.content, dict) else {}
-                note_id = clean(note.id)
-                authors = _openreview_value(content.get("authors")) or []
-                timestamp = getattr(note, "pdate", None) or getattr(note, "cdate", None)
-                published = datetime.fromtimestamp(timestamp / 1000, timezone.utc).date().isoformat() if timestamp else f"{year}-01-01"
-                rows.append({
-                    "title": _openreview_value(content.get("title")),
-                    "abstract": _openreview_value(content.get("abstract")),
-                    "authors": authors if isinstance(authors, list) else clean(authors),
-                    "published": published,
-                    "year": year,
-                    "url": f"https://openreview.net/forum?id={note_id}",
-                    "pdf_url": f"https://openreview.net/pdf?id={note_id}",
-                    "venue": venue_name,
-                    "categories": _openreview_value(content.get("primary_area")) or _openreview_value(content.get("subject_areas")) or [],
-                    "keywords": _openreview_value(content.get("keywords")) or [],
-                    "presentation_type": _openreview_value(content.get("venue")) or "",
-                    "identifiers": {"openreview_id": note_id, "doi": clean(_openreview_value(content.get("doi")))},
-                })
-            offset += len(notes)
-            if probe_limit and len(rows) >= probe_limit:
-                break
-            if len(notes) < page_limit:
-                break
-            time.sleep(2.1)
         if probe_limit and len(rows) >= probe_limit:
             break
     if probe_limit:
@@ -987,6 +1013,14 @@ def validate_plan(plan: Any) -> dict[str, Any]:
                 raise ValueError(f"sources[{index}] venue cannot use a result limit; conference metadata must be complete")
             if any(source.get(key) for key in ("queries", "categories", "tracks")):
                 raise ValueError(f"sources[{index}] venue cannot apply topic/category/track filters during acquisition")
+            if "minimum_catalog_records" in source:
+                try:
+                    minimum_catalog_records = int(source["minimum_catalog_records"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"sources[{index}].minimum_catalog_records must be a positive integer") from exc
+                if minimum_catalog_records < 1:
+                    raise ValueError(f"sources[{index}].minimum_catalog_records must be a positive integer")
+                source["minimum_catalog_records"] = minimum_catalog_records
     if workflow["mode"] == "comprehensive" and not request_scope["user_specified_time"] and not request_scope["user_specified_channels"]:
         as_of = date_text(request_scope.get("as_of_date"))
         if not as_of:
@@ -1085,6 +1119,8 @@ def metadata_cache_inventory() -> dict[str, Any]:
 
 def _recover_conference_caches_from_runs() -> list[dict[str, Any]]:
     recovered = []
+    if clean(os.environ.get("RECOMMEND_PAPERS_DISABLE_RUN_CACHE_RECOVERY")).lower() in {"1", "true", "yes"}:
+        return recovered
     runs_root = DATA_ROOT / "runs"
     if not runs_root.is_dir():
         return recovered
@@ -1252,7 +1288,7 @@ def fetch_source(spec: dict[str, Any], *, policy: str, max_age_days: float) -> t
             cached_rows = cached.get("papers") if isinstance(cached.get("papers"), list) else []
             audit = venue_metadata_audit(
                 cached_rows,
-                require_complete_abstracts=True,
+                require_complete_abstracts=bool(spec.get("require_complete_abstracts", True)),
                 require_official_categories=venue_id in {"iclr", "icml"},
             )
             cache_has_required_coverage = cache_has_required_coverage and audit["metadata_completeness_ok"]
@@ -1316,6 +1352,19 @@ def _transient_probe_error(exc: BaseException) -> bool:
     ))
 
 
+def _authoritative_probe_empty(exc: BaseException) -> bool:
+    """Classify exact-year archival absence without treating it as a crawler failure."""
+    response = getattr(exc, "response", None)
+    if response is not None and getattr(response, "status_code", None) == 404:
+        return True
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in (
+        "404 client error",
+        "official proceedings index unavailable",
+        "has no published issue for",
+    ))
+
+
 def probe_venue(
     spec: dict[str, Any],
     start_year: int,
@@ -1325,6 +1374,10 @@ def probe_venue(
 ) -> dict[str, Any]:
     attempts: list[dict[str, Any]] = []
     result: dict[str, Any] | None = None
+    try:
+        probe_wall_timeout = max(5.0, min(300.0, float(os.environ.get("RECOMMEND_PAPERS_PROBE_WALL_TIMEOUT_SECONDS", "30") or 30)))
+    except (TypeError, ValueError):
+        probe_wall_timeout = 30.0
     for year in range(start_year, start_year - max(1, lookback), -1):
         if not _regular_venue_year(clean(spec.get("venue_id")).lower(), year):
             attempts.append({"year": year, "status": "not_scheduled", "count": 0})
@@ -1344,7 +1397,7 @@ def probe_venue(
             try:
                 # Match TASTE's probe semantics: one bounded title sample and
                 # short detail budget, never a hidden full venue crawl.
-                with bounded_request_policy(max_attempts=2, max_wait_seconds=5.0):
+                with bounded_request_policy(max_attempts=2, max_wait_seconds=5.0, wall_timeout_seconds=probe_wall_timeout):
                     rows, source_receipt = _probe_venue_exact(candidate, sample_limit)
                 attempts.append({"year": year, "adapter": adapter, "status": "available" if rows else "empty", "count": len(rows), "details": source_receipt})
                 if rows:
@@ -1361,6 +1414,17 @@ def probe_venue(
                     }
                     break
             except Exception as exc:
+                if _authoritative_probe_empty(exc):
+                    attempts.append({
+                        "year": year,
+                        "adapter": adapter,
+                        "status": "empty",
+                        "count": 0,
+                        "authoritative_absence": True,
+                        "error_type": type(exc).__name__,
+                        "message": str(exc)[:500],
+                    })
+                    continue
                 transient = _transient_probe_error(exc)
                 transient_for_year = transient_for_year or transient
                 error_for_year = True
