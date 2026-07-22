@@ -11,7 +11,7 @@ from .storage import now_iso, read_json, safe_write_target, update_run, write_js
 
 
 SECTIONS = ("摘要", "动机与核心创新", "方法", "实验结果", "优缺点总结")
-READ_CONTRACT_VERSION = 3
+READ_CONTRACT_VERSION = 4
 _ENGLISH_WORD_RE = re.compile(r"[A-Za-z]+(?:[-'][A-Za-z]+)*")
 _ENGLISH_FUNCTION_WORDS = {"a", "an", "and", "are", "as", "by", "for", "from", "in", "is", "of", "on", "our", "that", "the", "this", "to", "we", "which", "with"}
 _PROSE_LATEX_COMMAND_RE = re.compile(r"\\[A-Za-z]+")
@@ -52,6 +52,14 @@ def _source_abstract(paper: dict[str, Any]) -> str:
     return clean(paper.get("abstract_en") or paper.get("abstract") or metadata.get("abstract_en") or metadata.get("abstract"))
 
 
+def _accepted_pdf_url(item: dict[str, Any], paper: dict[str, Any]) -> str:
+    attempts = item.get("attempts") if isinstance(item.get("attempts"), dict) else {}
+    for attempt in attempts.get("pdf") or []:
+        if isinstance(attempt, dict) and attempt.get("accepted") is True and clean(attempt.get("url")):
+            return clean(attempt.get("url"))
+    return clean(paper.get("pdf_url"))
+
+
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -63,6 +71,65 @@ def _paper_dir(run_dir: Path, item: dict[str, Any]) -> Path:
 def _read_cache(item: dict[str, Any]) -> Path:
     paper = item.get("paper") if isinstance(item.get("paper"), dict) else {}
     return FULLTEXT_CACHE_ROOT / cache_key(paper) / "reading"
+
+
+def _markdown_link(label: str, url: Any) -> str:
+    value = clean(url)
+    return f"[{label}](<{value}>)" if value.startswith("http") else "未提供"
+
+
+def _deep_read_prompt(item: dict[str, Any]) -> str:
+    source = clean(item.get("source")) or "来源未提供"
+    published = clean(item.get("published"))
+    conference_key = re.sub(r"[^a-z0-9]+", "", source.lower())
+    conference_keys = {"neurips", "nips", "iclr", "icml", "sigkdd", "kdd", "sigir", "cikm", "aaai", "iccv", "www", "cvpr", "acl", "ijcai", "eccv", "emnlp"}
+    year_match = re.search(r"\b(?:19|20)\d{2}\b", published)
+    source_date = year_match.group(0) if conference_key in conference_keys and year_match else published
+    source_label = f"{source} {source_date}".strip()
+    abstract_rule = (
+        "把 source_abstract 的每个英文句子完整翻译成中文，不得概括、漏掉数字/结论/限制；专名和缩写可保留英文。"
+        if clean(item.get("source_abstract")) else
+        "来源摘要缺失；在回执中报告证据缺口，不得用元数据臆造摘要。"
+    )
+    return f"""你是 TASTE Reading 为这一篇论文启动的专用 Claude 精读进程。只处理本队列项，不得读取其他论文，也不得调用 Agent 或 Task。
+
+允许读取：
+- 全文：`{item.get('full_text_path')}`
+- 本地 PDF（如存在）：`{item.get('local_pdf_path') or '未提供'}`
+- 本任务说明：`{item.get('prompt_path')}`
+
+只允许写入以下两个文件，不得在工作区或论文目录写其他文件：
+- `{item.get('read_path')}`
+- `{item.get('receipt_path')}`
+
+必须从头到尾分块检查全文，不能只读摘要、开头或搜索片段。完成后 `evidence_chars` 必须不少于 {int(item.get('full_text_chars') or 0)}，并绑定给定 SHA-256。科学内容只写入 read.md；receipt 只写机器状态、哈希、路径和逐句摘要翻译映射。
+
+read.md 必须严格使用：
+# {item.get('title')}
+
+- **来源：** {source_label}
+- **论文链接：** URL：{_markdown_link('论文页面', item.get('paper_url'))}；PDF：{_markdown_link('PDF', item.get('pdf_url'))}
+
+## 摘要
+## 动机与核心创新
+## 方法
+## 实验结果
+## 优缺点总结
+
+内容规则：
+- 摘要：{abstract_rule}
+- 动机与核心创新：两段分别以“动机：”“核心创新：”开头，合计 200–250 个中文字符。
+- 方法：只讲本文提出的机制，300–400 个中文字符；至少一个来自正文语境的 KaTeX 公式并紧接通俗解释。行内公式用 `$...$`，展示公式用独占行的 `$$` 包围，不用自定义宏。
+- 实验结果：20–150 个中文字符，写清实验类型、关键比较和总体结果。
+- 优缺点总结：20–100 个中文字符，同时指出优势与证据边界。
+- 所有二级栏目必须是实质中文；不得把模板化段落复用于其他论文。
+
+receipt JSON 必须满足：
+- `status="complete"`, `paper_id="{item.get('paper_id')}"`, `title="{item.get('title')}"`, `source="{source}"`, `subagent_deep_read=true`, `article_markdown_path="{item.get('read_path')}"`。
+- `abstract_sentence_map` 按 source_abstract 原句顺序提供 `source_sha256` 与 `translation_zh`。
+- `deep_read_audit.mode="dedicated_claude_subagent"`, `subagent_used=true`, `status="complete"`, `text_path="{item.get('full_text_path')}"`, `evidence_chars` 覆盖全文，`article_markdown_path` 为上述 read.md，`article_markdown_written=true`。
+- `deep_read_audit.full_text_sha256="{item.get('full_text_sha256')}"`, `source_abstract_sha256="{item.get('source_abstract_sha256')}"`，并在写完 read.md 后计算准确的 `read_sha256`。
+"""
 
 
 def prepare_reads(run_dir: Path) -> dict[str, Any]:
@@ -87,22 +154,76 @@ def prepare_reads(run_dir: Path) -> dict[str, Any]:
         else:
             paper = item.get("paper") if isinstance(item.get("paper"), dict) else {}
             source_abstract = _source_abstract(paper)
-            pending.append({
+            queue_item = {
                 "identity": item.get("identity"),
                 "paper_id": item.get("identity"),
                 "title": (item.get("paper") or {}).get("title"),
                 "source": clean(paper.get("venue") or paper.get("source")),
+                "authors": paper.get("authors") if isinstance(paper.get("authors"), list) else [],
+                "published": clean(paper.get("published") or paper.get("year")),
+                "paper_url": clean(paper.get("url")),
+                "pdf_url": _accepted_pdf_url(item, paper),
+                "local_pdf_path": clean(item.get("pdf_path")),
+                "run_dir": str(directory),
                 "full_text_path": item.get("text_path"),
                 "read_path": str(target),
                 "receipt_path": str(paper_dir / "read_receipt.json"),
+                "prompt_path": str(paper_dir / "read_prompt.md"),
                 "full_text_chars": item.get("text_chars"),
                 "full_text_sha256": fingerprints["full_text_sha256"],
                 "source_abstract": source_abstract,
                 "source_abstract_sha256": _sha256_text(source_abstract),
-            })
+            }
+            write_text(Path(queue_item["prompt_path"]), _deep_read_prompt(queue_item))
+            pending.append(queue_item)
     payload = {"schema_version": 1, "status": "pending" if pending else "ready_for_validation", "ready_full_text_count": len(items), "restored_count": len(restored), "pending_count": len(pending), "restored": restored, "pending": pending, "generated_at": now_iso()}
     write_json(directory / "reading_queue.json", payload)
+    write_json(directory / "reading_mode.json", {"mode": "external_claude_per_paper", "selected_at": now_iso()})
     update_run(directory, stage="single_paper_reading", counts={"full_text_ready": len(items), "reads_restored": len(restored), "reads_pending": len(pending)})
+    return payload
+
+
+def prepare_fast_batches(run_dir: Path) -> dict[str, Any]:
+    directory = safe_write_target(run_dir)
+    items = _fulltext_items(directory)
+    base, remainder = divmod(len(items), 3)
+    sizes = [base + (1 if index < remainder else 0) for index in range(3)]
+    batches = []
+    cursor = 0
+    for batch_index, size in enumerate(sizes, 1):
+        assigned = []
+        for item in items[cursor:cursor + size]:
+            paper = item.get("paper") if isinstance(item.get("paper"), dict) else {}
+            assigned.append({
+                "identity": item.get("identity"),
+                "title": paper.get("title"),
+                "authors": paper.get("authors") if isinstance(paper.get("authors"), list) else [],
+                "source": clean(paper.get("venue") or paper.get("source")),
+                "published": clean(paper.get("published") or paper.get("year")),
+                "paper_url": clean(paper.get("url")),
+                "pdf_url": _accepted_pdf_url(item, paper),
+                "full_text_path": item.get("text_path"),
+                "full_text_chars": item.get("text_chars"),
+                "source_abstract": _source_abstract(paper),
+            })
+        cursor += size
+        manifest_path = directory / f"codex_fast_batch_{batch_index}.json"
+        batch = {"batch_id": batch_index, "paper_count": len(assigned), "items": assigned, "result_path": str(directory / f"codex_fast_batch_{batch_index}_results.json")}
+        write_json(manifest_path, batch)
+        batches.append({**batch, "manifest_path": str(manifest_path)})
+    payload = {
+        "schema_version": 1,
+        "status": "ready",
+        "reading_mode": "codex_fast_three_batches",
+        "paper_count": len(items),
+        "batch_count": 3,
+        "batch_sizes": sizes,
+        "batches": batches,
+        "generated_at": now_iso(),
+    }
+    write_json(directory / "codex_fast_batches.json", payload)
+    write_json(directory / "reading_mode.json", {"mode": "codex_fast_three_batches", "selected_at": now_iso()})
+    update_run(directory, stage="codex_fast_batch_reading", counts={"full_text_ready": len(items), "codex_fast_batches": 3})
     return payload
 
 
@@ -233,7 +354,7 @@ def validate_read(text: str, title: str, paper: dict[str, Any] | None = None) ->
 def _validate_receipt(receipt: Any, item: dict[str, Any], read_path: Path, full_text: str) -> list[str]:
     errors = []
     if not isinstance(receipt, dict):
-        return ["dedicated Codex subagent read_receipt.json is missing or invalid"]
+        return ["dedicated Claude read_receipt.json is missing or invalid"]
     audit = receipt.get("deep_read_audit") if isinstance(receipt.get("deep_read_audit"), dict) else {}
     paper = item.get("paper") if isinstance(item.get("paper"), dict) else {}
     source_abstract = _source_abstract(paper)
@@ -249,8 +370,8 @@ def _validate_receipt(receipt: Any, item: dict[str, Any], read_path: Path, full_
     declared_read_path = Path(clean(receipt.get("article_markdown_path"))).expanduser()
     if str(declared_read_path) == "." or declared_read_path.resolve(strict=False) != read_path.resolve(strict=False):
         errors.append("receipt article_markdown_path mismatch")
-    if audit.get("mode") != "dedicated_codex_subagent" or audit.get("subagent_used") is not True or audit.get("article_markdown_written") is not True:
-        errors.append("each paper must be read by a dedicated Codex subagent")
+    if audit.get("mode") != "dedicated_claude_subagent" or audit.get("subagent_used") is not True or audit.get("article_markdown_written") is not True:
+        errors.append("each paper must be read by its dedicated external Claude process")
     if clean(audit.get("full_text_sha256")) != fingerprints["full_text_sha256"]:
         errors.append("receipt full-text fingerprint mismatch")
     if clean(audit.get("source_abstract_sha256")) != _sha256_text(source_abstract):

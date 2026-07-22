@@ -1,4 +1,4 @@
 interface:
   display_name: "Recommend Papers"
-  short_description: "Codex-driven scholarly search, reading, and ranking"
-  default_prompt: "Use $recommend-papers with a compatible Python environment, keep all runtime files outside Git repositories, and recommend the most useful papers for my request."
+  short_description: "Flexible multi-turn scholarly research"
+  default_prompt: "Use $recommend-papers as a flexible multi-turn research tool: reuse prior evidence when sufficient, search or read only what this question needs, and apply my per-turn settings before defaults."

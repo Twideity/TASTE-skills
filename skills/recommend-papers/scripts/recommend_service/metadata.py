@@ -17,8 +17,9 @@ from urllib.parse import quote
 from bs4 import BeautifulSoup
 
 from .credentials import openreview_settings
-from .http import get, receipt
+from .http import get, receipt, service_call
 from .storage import DATA_ROOT, METADATA_CACHE_ROOT, now_iso, read_json, stable_hash, write_json
+from .venue_sources import fetch_official_venue
 
 
 ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
@@ -26,16 +27,39 @@ OPENSEARCH_NS = "http://a9.com/-/spec/opensearch/1.1/"
 DEFAULT_ARXIV_AI_CATEGORIES = ("cs.AI", "cs.LG", "stat.ML", "cs.CL", "cs.CV", "cs.IR", "cs.RO", "eess.SY", "cs.MA", "cs.NE")
 BIORXIV_RECHECK_DAYS = 3
 BIORXIV_RECHECK_MAX_AGE_DAYS = 1.0
+PRIORITY_VENUE_NAMES = {
+    "neurips": "NeurIPS", "nips": "NeurIPS", "iclr": "ICLR", "icml": "ICML",
+    "kdd": "KDD", "sigkdd": "KDD", "sigir": "SIGIR", "cikm": "CIKM",
+    "www": "WWW", "aaai": "AAAI", "iccv": "ICCV", "cvpr": "CVPR",
+    "acl": "ACL", "ijcai": "IJCAI", "eccv": "ECCV", "emnlp": "EMNLP",
+}
+KNOWN_CONFERENCE_RELEASE_DATES = {
+    ("ICLR", 2026): "2026-04-23", ("ICLR", 2025): "2025-04-24",
+    ("NEURIPS", 2026): "2026-12-06", ("NEURIPS", 2025): "2025-12-02",
+    ("ICML", 2026): "2026-05-08", ("ICML", 2025): "2025-07-13",
+    ("KDD", 2026): "2026-08-09", ("KDD", 2025): "2025-08-03",
+    ("SIGIR", 2026): "2026-07-20", ("SIGIR", 2025): "2025-07-13",
+    ("CIKM", 2026): "2026-11-09", ("WWW", 2026): "2026-04-13",
+    ("AAAI", 2026): "2026-01-20", ("CVPR", 2026): "2026-06-03",
+    ("ICCV", 2026): "2026-12-31", ("ECCV", 2026): "2026-09-08",
+    ("ACL", 2026): "2026-07-05", ("IJCAI", 2026): "2026-08-15",
+    ("EMNLP", 2026): "2026-11-01",
+}
 DEFAULT_VENUES = [
-    {"id": "neurips", "name": "NeurIPS", "aliases": ["NIPS"], "adapter": "openreview", "query": "NeurIPS", "openreview_venue_id_template": "NeurIPS.cc/{year}/Conference", "require_complete_abstracts": True, "require_official_categories": False, "dblp_volume_template": "https://dblp.org/db/conf/nips/neurips{year}.xml"},
+    {"id": "neurips", "name": "NeurIPS", "aliases": ["NIPS"], "adapter": "neurips_official", "fallback_adapters": ["openreview"], "query": "NeurIPS", "openreview_venue_id_template": "NeurIPS.cc/{year}/Conference", "require_complete_abstracts": True, "require_official_categories": False, "dblp_volume_template": "https://dblp.org/db/conf/nips/neurips{year}.xml"},
     {"id": "iclr", "name": "ICLR", "aliases": [], "adapter": "openreview", "query": "ICLR", "openreview_venue_id_template": "ICLR.cc/{year}/Conference", "require_complete_abstracts": True, "require_official_categories": True},
-    {"id": "icml", "name": "ICML", "aliases": [], "adapter": "openreview", "query": "ICML", "openreview_venue_id_template": "ICML.cc/{year}/Conference", "require_complete_abstracts": True, "require_official_categories": True, "dblp_volume_template": "https://dblp.org/db/conf/icml/icml{year}.xml"},
-    {"id": "cvpr", "name": "CVPR", "aliases": [], "adapter": "dblp", "query": "CVPR", "dblp_volume_template": "https://dblp.org/db/conf/cvpr/cvpr{year}.xml"},
-    {"id": "acl", "name": "ACL", "aliases": [], "adapter": "dblp", "query": "ACL"},
-    {"id": "emnlp", "name": "EMNLP", "aliases": [], "adapter": "dblp", "query": "EMNLP"},
-    {"id": "kdd", "name": "KDD", "aliases": ["SIGKDD"], "adapter": "dblp", "query": "KDD"},
-    {"id": "aaai", "name": "AAAI", "aliases": [], "adapter": "dblp", "query": "AAAI"},
-    {"id": "ijcai", "name": "IJCAI", "aliases": [], "adapter": "dblp", "query": "IJCAI"},
+    {"id": "icml", "name": "ICML", "aliases": [], "adapter": "openreview", "fallback_adapters": ["icml_official"], "query": "ICML", "openreview_venue_id_template": "ICML.cc/{year}/Conference", "require_complete_abstracts": True, "require_official_categories": True, "dblp_volume_template": "https://dblp.org/db/conf/icml/icml{year}.xml"},
+    {"id": "kdd", "name": "KDD", "aliases": ["SIGKDD"], "adapter": "acm_enriched", "query": "KDD", "require_complete_abstracts": True},
+    {"id": "sigir", "name": "SIGIR", "aliases": [], "adapter": "acm_enriched", "query": "SIGIR", "require_complete_abstracts": True},
+    {"id": "cikm", "name": "CIKM", "aliases": [], "adapter": "acm_enriched", "query": "CIKM", "require_complete_abstracts": True},
+    {"id": "www", "name": "WWW", "aliases": ["The Web Conference", "WebConf"], "adapter": "acm_enriched", "query": "WWW", "require_complete_abstracts": True},
+    {"id": "aaai", "name": "AAAI", "aliases": [], "adapter": "aaai_ojs", "query": "AAAI", "require_complete_abstracts": True},
+    {"id": "iccv", "name": "ICCV", "aliases": [], "adapter": "cvf_openaccess", "query": "ICCV", "require_complete_abstracts": True},
+    {"id": "cvpr", "name": "CVPR", "aliases": [], "adapter": "cvf_openaccess", "query": "CVPR", "require_complete_abstracts": True},
+    {"id": "acl", "name": "ACL", "aliases": [], "adapter": "acl_anthology", "query": "ACL", "require_complete_abstracts": True},
+    {"id": "ijcai", "name": "IJCAI", "aliases": [], "adapter": "ijcai_proceedings", "query": "IJCAI", "require_complete_abstracts": True},
+    {"id": "eccv", "name": "ECCV", "aliases": [], "adapter": "eccv_virtual", "fallback_adapters": ["openreview"], "openreview_venue_id_template": "thecvf.com/ECCV/{year}/Conference", "query": "ECCV", "require_complete_abstracts": True},
+    {"id": "emnlp", "name": "EMNLP", "aliases": [], "adapter": "acl_anthology", "query": "EMNLP", "require_complete_abstracts": True},
     {"id": "recomb", "name": "RECOMB", "aliases": [], "adapter": "dblp", "query": "RECOMB"},
     {"id": "ismb", "name": "ISMB", "aliases": [], "adapter": "dblp", "query": "ISMB"},
 ]
@@ -527,7 +551,45 @@ def fetch_dblp_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[s
     return rows, {"status": "complete", "complete_catalog": True, "exhaustion_proof": "complete_dblp_volume_xml", "requests": receipts, "count": len(rows), "metadata_audit": audit}
 
 
-def fetch_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _regular_venue_year(venue_id: str, year: int) -> bool:
+    if venue_id == "iccv":
+        return year % 2 == 1
+    if venue_id == "eccv":
+        return year % 2 == 0
+    return True
+
+
+def _venue_year_candidates(spec: dict[str, Any], *, as_of: date | None = None, max_backfill_years: int = 3) -> tuple[list[int], list[str]]:
+    years = [int(item) for item in spec.get("years") or []]
+    if len(years) != 1:
+        raise ValueError("Venue source requires exactly one requested year")
+    requested = years[0]
+    venue_id = clean(spec.get("venue_id")).lower()
+    venue_name = PRIORITY_VENUE_NAMES.get(venue_id, clean(spec.get("venue") or venue_id).upper())
+    cutoff = as_of or date.today()
+    reasons: list[str] = []
+    out: list[int] = []
+    for candidate in range(requested, requested - max(0, max_backfill_years) - 1, -1):
+        if not _regular_venue_year(venue_id, candidate):
+            reasons.append(f"{venue_name} {candidate} has no regular proceedings edition")
+            continue
+        release_text = KNOWN_CONFERENCE_RELEASE_DATES.get((venue_name.upper(), candidate))
+        if release_text and date.fromisoformat(release_text) > cutoff:
+            reasons.append(
+                f"{venue_name} {candidate} archival proceedings are expected after {cutoff.isoformat()}, "
+                "but live official, OpenReview, accepted-paper, virtual, ACM, and DBLP channels must still be probed"
+            )
+        out.append(candidate)
+    # If no authoritative release signal is known, retain the requested year
+    # first and let source availability decide whether to backfill.
+    if not out:
+        for candidate in range(requested, requested - max(0, max_backfill_years) - 1, -1):
+            if _regular_venue_year(venue_id, candidate):
+                out.append(candidate)
+    return out, reasons
+
+
+def _fetch_venue_exact(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     adapter = clean(spec.get("adapter")).lower()
     venue_id = clean(spec.get("venue_id"))
     known = next((item for item in DEFAULT_VENUES if item["id"] == venue_id), None)
@@ -539,7 +601,56 @@ def fetch_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, A
         return fetch_openreview_venue(merged)
     if adapter == "dblp":
         return fetch_dblp_venue(merged)
+    if adapter in {"neurips_official", "icml_official", "acm_enriched", "aaai_ojs", "cvf_openaccess", "acl_anthology", "ijcai_proceedings", "eccv_virtual"}:
+        rows, details = fetch_official_venue(merged)
+        normalized = [normalize(row, "venue") for row in rows]
+        audit = venue_metadata_audit(
+            normalized,
+            require_complete_abstracts=True,
+            require_official_categories=bool(merged.get("require_official_categories")),
+        )
+        if not audit["metadata_completeness_ok"]:
+            raise RuntimeError(f"Official venue metadata completeness audit failed: {audit}")
+        details["metadata_audit"] = audit
+        return normalized, details
     raise ValueError(f"Unsupported venue adapter: {adapter}")
+
+
+def fetch_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    requested_year = int((spec.get("years") or [0])[0])
+    candidates, reasons = _venue_year_candidates(spec)
+    attempts: list[dict[str, Any]] = []
+    last_error: Exception | None = None
+    for year in candidates:
+        known = next((item for item in DEFAULT_VENUES if item["id"] == clean(spec.get("venue_id"))), {})
+        primary_adapter = clean(spec.get("adapter") or known.get("adapter")).lower()
+        adapters = [primary_adapter, *[clean(item).lower() for item in known.get("fallback_adapters") or []]]
+        adapters = list(dict.fromkeys(item for item in adapters if item)) or [""]
+        for adapter in adapters:
+            candidate = dict(spec)
+            candidate["years"] = [year]
+            if adapter:
+                candidate["adapter"] = adapter
+            try:
+                rows, details = _fetch_venue_exact(candidate)
+                attempts.append({"year": year, "status": "available" if rows else "empty", "count": len(rows), "adapter": details.get("adapter") or adapter})
+                if not rows:
+                    continue
+                details.update({
+                    "requested_years": [requested_year],
+                    "effective_years": [year],
+                    "year_fallback": year != requested_year,
+                    "year_fallback_reason": " ".join(reasons + ([f"using latest available {clean(spec.get('venue_id')).upper()} year {year}"] if year != requested_year else [])),
+                    "year_attempts": attempts,
+                })
+                return rows, details
+            except Exception as exc:
+                last_error = exc
+                attempts.append({"year": year, "adapter": adapter, "status": "error", "error_type": type(exc).__name__, "message": str(exc)[:500]})
+                reasons.append(f"{year} {adapter or 'default'} source unavailable: {type(exc).__name__}: {str(exc)[:160]}")
+    if last_error:
+        raise RuntimeError(f"No usable venue year for requested {requested_year}; attempts={attempts}") from last_error
+    raise RuntimeError(f"No usable venue year for requested {requested_year}; attempts={attempts}")
 
 
 def _openreview_value(value: Any) -> Any:
@@ -554,26 +665,18 @@ def fetch_openreview_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], 
     if not years:
         raise ValueError("OpenReview venue source requires one resolved year")
     settings = openreview_settings()
-    client = None
-    login_errors = []
-    for attempt in range(1, 6):
-        try:
-            client = openreview.api.OpenReviewClient(
+    try:
+        client, login_errors = service_call(
+            "openreview",
+            lambda: openreview.api.OpenReviewClient(
                 baseurl="https://api2.openreview.net",
                 username=settings["username"] or None,
                 password=settings["password"] or None,
-            )
-            break
-        except Exception as exc:
-            message = str(exc)
-            login_errors.append({"attempt": attempt, "error_type": type(exc).__name__, "message": message[:500]})
-            rate_limited = "429" in message or "ratelimit" in message.lower() or "too many requests" in message.lower()
-            if not rate_limited or attempt >= 5:
-                raise
-            match = re.search(r"try again in\s+(\d+)\s+seconds", message, re.I)
-            time.sleep(min(90, max(5, int(match.group(1)) + 2 if match else 35)))
-    if client is None:
-        raise RuntimeError("OpenReview authenticated client initialization failed")
+            ),
+            max_attempts=5,
+        )
+    except Exception:
+        raise RuntimeError("OpenReview official client initialization failed after shared-channel retries")
     rows: list[dict[str, Any]] = []
     requests_info = []
     for year in years:
@@ -584,21 +687,11 @@ def fetch_openreview_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], 
         offset = 0
         while True:
             page_limit = 1000
-            notes = None
-            retry_errors = []
-            for attempt in range(1, 6):
-                try:
-                    notes = client.get_notes(content={"venueid": venue_id}, limit=page_limit, offset=offset)
-                    break
-                except Exception as exc:
-                    message = str(exc)
-                    retry_errors.append({"attempt": attempt, "error_type": type(exc).__name__, "message": message[:500]})
-                    rate_limited = "429" in message or "ratelimit" in message.lower() or "too many requests" in message.lower()
-                    if not rate_limited or attempt >= 5:
-                        raise
-                    match = re.search(r"try again in\s+(\d+)\s+seconds", message, re.I)
-                    wait_seconds = min(90, max(5, int(match.group(1)) + 2 if match else 35))
-                    time.sleep(wait_seconds)
+            notes, retry_errors = service_call(
+                "openreview",
+                lambda: client.get_notes(content={"venueid": venue_id}, limit=page_limit, offset=offset),
+                max_attempts=5,
+            )
             notes = notes or []
             requests_info.append({"venue_id": venue_id, "offset": offset, "limit": page_limit, "count": len(notes), "authenticated": settings["authenticated"], "retry_errors": retry_errors})
             if not notes:
@@ -752,27 +845,77 @@ FETCHERS: dict[str, Callable[[dict[str, Any]], tuple[list[dict[str, Any]], dict[
     "science": fetch_crossref,
 }
 
+WORKFLOW_MODES = {"comprehensive", "focused", "incremental", "metadata_only"}
+STOP_AFTER_STAGES = {"metadata", "shortlist", "fulltext", "reading", "recommendation"}
+READING_PREFERENCES = {"auto", "external_claude", "codex_fast"}
+
+
+def _validated_workflow(plan: dict[str, Any], request_scope: dict[str, Any]) -> dict[str, Any]:
+    raw = plan.get("workflow")
+    if raw is None:
+        mode = "comprehensive" if not request_scope["user_specified_time"] and not request_scope["user_specified_channels"] else "focused"
+        raw = {"mode": mode}
+    if not isinstance(raw, dict):
+        raise ValueError("workflow must be an object when provided")
+    mode = clean(raw.get("mode") or "comprehensive").lower()
+    if mode not in WORKFLOW_MODES:
+        raise ValueError(f"workflow.mode must be one of {sorted(WORKFLOW_MODES)}")
+    stop_after = clean(raw.get("stop_after") or ("metadata" if mode == "metadata_only" else "recommendation")).lower()
+    if stop_after not in STOP_AFTER_STAGES:
+        raise ValueError(f"workflow.stop_after must be one of {sorted(STOP_AFTER_STAGES)}")
+    reading = clean(raw.get("reading_preference") or "auto").lower()
+    if reading not in READING_PREFERENCES:
+        raise ValueError(f"workflow.reading_preference must be one of {sorted(READING_PREFERENCES)}")
+    if reading == "codex_fast" and raw.get("user_disabled_claude") is not True and raw.get("claude_unavailable") is not True:
+        raise ValueError("codex_fast requires user_disabled_claude=true or claude_unavailable=true")
+    if reading == "codex_fast" and raw.get("user_disabled_claude") is True:
+        preference_scope = clean(raw.get("reading_preference_scope") or "conversation").lower()
+        if preference_scope not in {"conversation", "current_turn"}:
+            raise ValueError("workflow.reading_preference_scope must be conversation or current_turn")
+        raw = {
+            **raw,
+            "reading_preference_scope": preference_scope,
+            "conversation_reading_preference_locked": raw.get("conversation_reading_preference_locked", preference_scope == "conversation"),
+        }
+    rationale = clean(raw.get("rationale"))
+    question = clean(raw.get("research_question") or plan.get("research_question"))
+    if mode != "comprehensive" and (not rationale or not question):
+        raise ValueError("non-comprehensive workflow requires research_question and workflow.rationale")
+    normalized = {**raw, "mode": mode, "research_question": question, "rationale": rationale, "stop_after": stop_after, "reading_preference": reading}
+    for key in ("shortlist_target", "final_target"):
+        if key in normalized:
+            try:
+                value = int(normalized[key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"workflow.{key} must be a positive integer") from exc
+            if value < 1:
+                raise ValueError(f"workflow.{key} must be a positive integer")
+            normalized[key] = value
+    return normalized
+
 
 def validate_plan(plan: Any) -> dict[str, Any]:
     if not isinstance(plan, dict) or not isinstance(plan.get("sources"), list) or not plan["sources"]:
         raise ValueError("Plan requires a non-empty sources array")
+    request_scope = plan.get("request_scope")
+    if not isinstance(request_scope, dict) or not isinstance(request_scope.get("user_specified_time"), bool) or not isinstance(request_scope.get("user_specified_channels"), bool):
+        raise ValueError("Plan requires request_scope with boolean user_specified_time and user_specified_channels")
+    workflow = _validated_workflow(plan, request_scope)
+    plan["workflow"] = workflow
     decisions = plan.get("channel_decisions")
     if not isinstance(decisions, list) or not decisions:
         raise ValueError("Plan requires channel_decisions")
     for index, decision in enumerate(decisions):
         if not isinstance(decision, dict) or clean(decision.get("decision")).lower() not in {"include", "exclude"} or not clean(decision.get("channel")) or not clean(decision.get("reason")):
             raise ValueError(f"channel_decisions[{index}] requires channel, include/exclude decision, and reason")
-    included = {clean(item.get("channel")).lower() for item in decisions if clean(item.get("decision")).lower() == "include"}
     considered = {clean(item.get("channel")).lower() for item in decisions}
-    for baseline in ("neurips/nips", "iclr", "icml", "arxiv"):
-        aliases = {baseline}
-        if baseline == "neurips/nips":
-            aliases.update({"neurips", "nips"})
-        if not considered & aliases:
-            raise ValueError(f"Baseline channel not considered: {baseline}")
-    request_scope = plan.get("request_scope")
-    if not isinstance(request_scope, dict) or not isinstance(request_scope.get("user_specified_time"), bool) or not isinstance(request_scope.get("user_specified_channels"), bool):
-        raise ValueError("Plan requires request_scope with boolean user_specified_time and user_specified_channels")
+    if workflow["mode"] == "comprehensive":
+        for baseline in ("neurips/nips", "iclr", "icml", "arxiv"):
+            aliases = {baseline}
+            if baseline == "neurips/nips":
+                aliases.update({"neurips", "nips"})
+            if not considered & aliases:
+                raise ValueError(f"Baseline channel not considered: {baseline}")
     for index, source in enumerate(plan["sources"]):
         if not isinstance(source, dict) or clean(source.get("type")).lower() not in FETCHERS:
             raise ValueError(f"sources[{index}] has unsupported type")
@@ -790,7 +933,7 @@ def validate_plan(plan: Any) -> dict[str, Any]:
                 raise ValueError(f"sources[{index}] venue cannot use a result limit; conference metadata must be complete")
             if any(source.get(key) for key in ("queries", "categories", "tracks")):
                 raise ValueError(f"sources[{index}] venue cannot apply topic/category/track filters during acquisition")
-    if not request_scope["user_specified_time"] and not request_scope["user_specified_channels"]:
+    if workflow["mode"] == "comprehensive" and not request_scope["user_specified_time"] and not request_scope["user_specified_channels"]:
         as_of = date_text(request_scope.get("as_of_date"))
         if not as_of:
             raise ValueError("Default research scope requires request_scope.as_of_date")
@@ -834,7 +977,7 @@ def _source_cache_path(spec: dict[str, Any], cache_key: str) -> Path:
     kind = re.sub(r"[^a-z0-9._-]+", "_", clean(spec.get("type")).lower()) or "unknown"
     if kind == "venue":
         raw_venue = clean(spec.get("venue_id") or spec.get("venue") or "unknown")
-        venue = {"iclr": "ICLR", "icml": "ICML", "neurips": "NeurIPS", "nips": "NeurIPS"}.get(raw_venue.lower(), re.sub(r"[^A-Za-z0-9._-]+", "_", raw_venue))
+        venue = PRIORITY_VENUE_NAMES.get(raw_venue.lower(), re.sub(r"[^A-Za-z0-9._-]+", "_", raw_venue))
         years = [int(item) for item in spec.get("years") or []]
         year = str(years[0]) if len(years) == 1 else "unknown-year"
         return METADATA_CACHE_ROOT / "conference" / venue / f"{year}.json"
@@ -943,7 +1086,7 @@ def migrate_metadata_caches() -> dict[str, Any]:
                     path.unlink()
                 continue
             winner, payload = max(complete, key=lambda item: (str(item[1].get("fetched_at") or ""), len(item[1].get("papers") or [])))
-            canonical_venue = {"iclr": "ICLR", "icml": "ICML", "neurips": "NeurIPS", "nips": "NeurIPS"}.get(venue, venue)
+            canonical_venue = PRIORITY_VENUE_NAMES.get(venue, venue)
             moves.append(_move_preserving(winner, METADATA_CACHE_ROOT / "conference" / canonical_venue / f"{year}.json"))
             for path, _ in candidates:
                 if path.exists():
@@ -1029,18 +1172,39 @@ def fetch_source(spec: dict[str, Any], *, policy: str, max_age_days: float) -> t
     if kind == "biorxiv":
         papers, biorxiv_receipt = fetch_biorxiv_cached(spec, policy=policy, max_age_days=max_age_days)
         return papers, {"status": "cache_hit" if biorxiv_receipt["cache_status"] == "hit" else "cache_miss", "count": len(papers), "details": biorxiv_receipt}
-    cache_path = _source_cache_path(spec, cache_key)
+    cache_specs = [spec]
+    if kind == "venue":
+        candidate_years, _ = _venue_year_candidates(spec)
+        cache_specs = [{**spec, "years": [year]} for year in candidate_years] or [spec]
+    cache_paths = [_source_cache_path(item, stable_hash(item)) for item in cache_specs]
+    cache_path = cache_paths[0]
     legacy_path = METADATA_CACHE_ROOT / f"{cache_key}.json"
     if not cache_path.exists() and legacy_path.is_file():
         _move_preserving(legacy_path, cache_path)
-    cached = read_json(cache_path, {})
-    if policy in {"reuse", "only"} and isinstance(cached, dict) and cached.get("papers") and (policy == "only" or _cache_fresh(cached, max_age_days)):
+    cached = {}
+    if policy in {"reuse", "only"}:
+        for candidate_path in cache_paths:
+            candidate_payload = read_json(candidate_path, {})
+            if isinstance(candidate_payload, dict) and candidate_payload.get("papers") and (policy == "only" or _cache_fresh(candidate_payload, max_age_days)):
+                cached = candidate_payload
+                cache_path = candidate_path
+                break
+    if policy in {"reuse", "only"} and isinstance(cached, dict) and cached.get("papers"):
         cached_receipt = cached.get("receipt") if isinstance(cached.get("receipt"), dict) else {}
         cache_has_required_coverage = (
             cached_receipt.get("complete_catalog") is True if kind == "venue"
             else cached_receipt.get("exhausted") is True and cached_receipt.get("truncated") is False and bool(cached_receipt.get("exhaustion_proof")) if kind == "biorxiv"
             else True
         )
+        venue_id = clean(spec.get("venue_id") or spec.get("venue")).lower()
+        if kind == "venue" and venue_id in PRIORITY_VENUE_NAMES:
+            cached_rows = cached.get("papers") if isinstance(cached.get("papers"), list) else []
+            audit = venue_metadata_audit(
+                cached_rows,
+                require_complete_abstracts=True,
+                require_official_categories=venue_id in {"iclr", "icml"},
+            )
+            cache_has_required_coverage = cache_has_required_coverage and audit["metadata_completeness_ok"]
         if cache_has_required_coverage:
             return cached["papers"], {"status": "cache_hit", "cache_path": str(cache_path), "fetched_at": cached.get("fetched_at"), "count": len(cached["papers"]), "details": cached_receipt}
     if policy == "only":
@@ -1049,6 +1213,10 @@ def fetch_source(spec: dict[str, Any], *, policy: str, max_age_days: float) -> t
     if kind == "venue" and source_receipt.get("complete_catalog") is not True:
         raise RuntimeError("Venue adapter did not prove complete-catalog acquisition")
     normalized = [normalize(item, kind) for item in papers if isinstance(item, dict) and clean(item.get("title"))]
+    if kind == "venue" and isinstance(source_receipt.get("effective_years"), list) and len(source_receipt["effective_years"]) == 1:
+        effective_spec = dict(spec)
+        effective_spec["years"] = [int(source_receipt["effective_years"][0])]
+        cache_path = _source_cache_path(effective_spec, stable_hash(effective_spec))
     payload = {"schema_version": 1, "cache_key": cache_key, "source": spec, "fetched_at": now_iso(), "papers": normalized, "receipt": source_receipt}
     write_json(cache_path, payload)
     return normalized, {"status": "cache_miss", "cache_path": str(cache_path), "fetched_at": payload["fetched_at"], "count": len(normalized), "details": source_receipt}
@@ -1067,7 +1235,7 @@ def deduplicate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def catalog(query: str = "") -> dict[str, Any]:
     needle = clean(query).lower()
     venues = [dict(item) for item in DEFAULT_VENUES if not needle or needle in json.dumps(item).lower()]
-    return {"query": query, "count": len(venues), "venues": venues, "custom_venue_policy": "Use adapter=openreview with an official venue ID, or adapter=dblp with a venue query and—when known—DBLP key prefixes."}
+    return {"query": query, "count": len(venues), "venues": venues, "custom_venue_policy": "Use a built-in official adapter whenever the venue is catalogued. Custom venues may use OpenReview with an official venue ID or DBLP complete-volume XML, but title-only DBLP metadata is not a verified priority-venue corpus."}
 
 
 def probe_venue(spec: dict[str, Any], start_year: int, lookback: int, sample_limit: int) -> dict[str, Any]:
@@ -1075,12 +1243,12 @@ def probe_venue(spec: dict[str, Any], start_year: int, lookback: int, sample_lim
     for year in range(start_year, start_year - max(1, lookback), -1):
         candidate = dict(spec)
         candidate["years"] = [year]
-        candidate["limit"] = max(1, sample_limit)
         try:
             rows, source_receipt = fetch_venue(candidate)
-            attempts.append({"year": year, "status": "available" if rows else "empty", "count": len(rows), "details": source_receipt})
+            effective = [int(item) for item in source_receipt.get("effective_years") or [year]]
+            attempts.append({"requested_year": year, "effective_years": effective, "status": "available" if rows else "empty", "count": len(rows), "details": source_receipt})
             if rows:
-                return {"resolved_year": year, "attempts": attempts, "samples": [normalize(row, "venue") for row in rows[:sample_limit]]}
+                return {"requested_year": year, "resolved_year": effective[0], "year_fallback": effective[0] != year, "year_fallback_reason": source_receipt.get("year_fallback_reason", ""), "attempts": attempts, "samples": [normalize(row, "venue") for row in rows[:sample_limit]]}
         except Exception as exc:
             attempts.append({"year": year, "status": "error", "count": 0, "error_type": type(exc).__name__, "message": str(exc)[:500]})
     return {"resolved_year": None, "attempts": attempts, "samples": []}

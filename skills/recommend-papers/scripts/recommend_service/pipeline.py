@@ -179,9 +179,17 @@ def finalize(run_dir: Path, evidence_path: Path, target: int) -> dict[str, Any]:
     metadata = read_json(directory / "metadata.json", {})
     shortlist = read_json(directory / "shortlist.json", {})
     read_artifacts = read_json(directory / "read_artifacts.json", {})
-    if not isinstance(read_artifacts, dict) or read_artifacts.get("status") != "complete" or read_artifacts.get("read_contract_version") != READ_CONTRACT_VERSION:
-        raise ValueError("Every acquired paper must have a validated single-paper read.md before finalization")
+    fast_batches = read_json(directory / "codex_fast_batches.json", {})
+    reading_mode = read_json(directory / "reading_mode.json", {}).get("mode")
+    fast_mode = reading_mode == "codex_fast_three_batches" and isinstance(fast_batches, dict) and fast_batches.get("status") == "ready" and fast_batches.get("reading_mode") == "codex_fast_three_batches"
+    if not fast_mode and (not isinstance(read_artifacts, dict) or read_artifacts.get("status") != "complete" or read_artifacts.get("read_contract_version") != READ_CONTRACT_VERSION):
+        raise ValueError("Default Claude mode requires one validated single-paper read.md per acquired paper")
     reads = {clean(item.get("identity")): item for item in read_artifacts.get("items") or [] if isinstance(item, dict)}
+    fast_assignment = {
+        clean(item.get("identity")): int(batch.get("batch_id") or 0)
+        for batch in fast_batches.get("batches") or [] if isinstance(batch, dict)
+        for item in batch.get("items") or [] if isinstance(item, dict)
+    } if fast_mode else {}
     fulltext = read_json(directory / "full_text_results.json", {})
     metadata_fingerprint = metadata.get("metadata_fingerprint")
     if metadata_fingerprint and (shortlist.get("metadata_fingerprint") != metadata_fingerprint or fulltext.get("metadata_fingerprint") != metadata_fingerprint or fulltext.get("shortlist_fingerprint") != stable_hash(shortlist)):
@@ -196,7 +204,7 @@ def finalize(run_dir: Path, evidence_path: Path, target: int) -> dict[str, Any]:
         identity = clean(card.get("identity"))
         if identity not in ready:
             raise ValueError(f"evidence card {index} is not a successfully acquired paper: {identity}")
-        if identity not in reads:
+        if not fast_mode and identity not in reads:
             raise ValueError(f"evidence card {index} has no validated single-paper read.md: {identity}")
         if identity in validated:
             raise ValueError(f"Duplicate evidence card: {identity}")
@@ -204,10 +212,14 @@ def finalize(run_dir: Path, evidence_path: Path, target: int) -> dict[str, Any]:
         expected_path = Path(clean(ready[identity].get("text_path"))).expanduser()
         if not cited_path.is_file() or cited_path.resolve() != expected_path.resolve():
             raise ValueError(f"evidence card {index} must cite the exact acquired full-text path")
-        read_path = Path(clean(card.get("read_path"))).expanduser()
-        expected_read_path = Path(clean(reads[identity].get("read_path"))).expanduser()
-        if not read_path.is_file() or read_path.resolve() != expected_read_path.resolve():
-            raise ValueError(f"evidence card {index} must cite the exact validated single-paper read.md")
+        if fast_mode:
+            if int(card.get("batch_id") or 0) != fast_assignment.get(identity):
+                raise ValueError(f"evidence card {index} has the wrong three-way Codex batch assignment")
+        else:
+            read_path = Path(clean(card.get("read_path"))).expanduser()
+            expected_read_path = Path(clean(reads[identity].get("read_path"))).expanduser()
+            if not read_path.is_file() or read_path.resolve() != expected_read_path.resolve():
+                raise ValueError(f"evidence card {index} must cite the exact validated single-paper read.md")
         values = {name: _number(card.get(name), label=f"evidence[{index}].{name}", maximum=FULLTEXT_MAXIMA[name]) for name in FULLTEXT_COMPONENTS}
         total = round(sum(values.values()), 4)
         declared = _number(card.get("final_score"), label=f"evidence[{index}].final_score", maximum=20)
@@ -230,6 +242,7 @@ def finalize(run_dir: Path, evidence_path: Path, target: int) -> dict[str, Any]:
         "shortfall": max(0, target_count - len(ordered)),
         "read_and_scored_count": len(ordered),
         "read_contract_version": READ_CONTRACT_VERSION,
+        "reading_mode": "codex_fast_three_batches" if fast_mode else "external_claude_per_paper",
         "ranking": ordered,
         "recommendations": ordered[:target_count],
         "generated_at": now_iso(),
@@ -244,10 +257,10 @@ def finalize(run_dir: Path, evidence_path: Path, target: int) -> dict[str, Any]:
 
 def complete(run_dir: Path, recommendations_path: Path) -> dict[str, Any]:
     directory = ensure_run(run_dir)
-    aggregate_reads = directory / "read.md"
-    if not aggregate_reads.is_file() or len(aggregate_reads.read_text(encoding="utf-8").strip()) < 200:
-        raise ValueError("Aggregated read.md is missing or incomplete")
     ranking = read_json(directory / "final_ranking.json", {})
+    aggregate_reads = directory / "read.md"
+    if ranking.get("reading_mode") != "codex_fast_three_batches" and (not aggregate_reads.is_file() or len(aggregate_reads.read_text(encoding="utf-8").strip()) < 200):
+        raise ValueError("Aggregated read.md is missing or incomplete")
     if ranking.get("read_contract_version") != READ_CONTRACT_VERSION:
         raise ValueError("final_ranking.json uses a stale reading contract; regenerate all per-paper reads and ranking")
     metadata = read_json(directory / "metadata.json", {})
@@ -269,3 +282,38 @@ def complete(run_dir: Path, recommendations_path: Path) -> dict[str, Any]:
         write_text(target, text)
     state = update_run(directory, stage="complete", status="complete", counts={"final_actual": len(recommendations)})
     return {"status": "complete", "run_id": directory.name, "run_dir": str(directory), "recommendation_count": len(recommendations), "run_state": state}
+
+
+def finish_stage(run_dir: Path, stage: str) -> dict[str, Any]:
+    directory = ensure_run(run_dir)
+    stage_name = clean(stage).lower()
+    if stage_name == "metadata":
+        artifact = read_json(directory / "metadata.json", {})
+        count = len(artifact.get("papers") or [])
+        valid = artifact.get("status") in {"complete", "complete_with_gaps"} and count > 0
+    elif stage_name == "shortlist":
+        artifact = read_json(directory / "shortlist.json", {})
+        count = len(artifact.get("papers") or [])
+        valid = count > 0
+    elif stage_name == "fulltext":
+        artifact = read_json(directory / "full_text_results.json", {})
+        count = sum(item.get("full_text_available") is True for item in artifact.get("items") or [] if isinstance(item, dict))
+        valid = isinstance(artifact.get("items"), list)
+    elif stage_name == "reading":
+        artifact = read_json(directory / "read_artifacts.json", {})
+        if read_json(directory / "reading_mode.json", {}).get("mode") == "codex_fast_three_batches":
+            batches = read_json(directory / "codex_fast_batches.json", {}).get("batches") or []
+            results = [read_json(Path(clean(batch.get("result_path"))), None) for batch in batches if isinstance(batch, dict)]
+            count = sum(len(result) for result in results if isinstance(result, list))
+            expected = {clean(item.get("identity")) for batch in batches if isinstance(batch, dict) for item in batch.get("items") or [] if isinstance(item, dict)}
+            actual = {clean(item.get("identity")) for result in results if isinstance(result, list) for item in result if isinstance(item, dict)}
+            valid = len(results) == 3 and all(isinstance(result, list) for result in results) and actual == expected
+        else:
+            count = int(artifact.get("validated_count") or 0)
+            valid = artifact.get("status") == "complete"
+    else:
+        raise ValueError("finish-stage supports metadata, shortlist, fulltext, or reading")
+    if not valid:
+        raise ValueError(f"Cannot finish at {stage_name}; its required artifact is missing or incomplete")
+    state = update_run(directory, stage=f"{stage_name}_complete", status="complete", counts={f"{stage_name}_items": count})
+    return {"status": "complete", "run_id": directory.name, "run_dir": str(directory), "completed_stage": stage_name, "item_count": count, "run_state": state}

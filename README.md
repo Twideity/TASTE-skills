@@ -2,9 +2,9 @@
 
 English | [中文](#中文说明)
 
-This repository contains `recommend-papers`, a standalone Codex skill for exhaustive scholarly metadata discovery, full-text acquisition, dedicated per-paper deep reading, reranking, and evidence-backed recommendations.
+This repository contains `recommend-papers`, a standalone Codex skill for exhaustive scholarly metadata discovery, dual-mode full-text reading, reranking, and evidence-backed recommendations.
 
-The backend crawls and normalizes paper metadata, acquires and caches full text, validates reading artifacts, and maintains resumable workflow state. Codex handles research scoping, source selection, title-and-abstract scoring, full-paper analysis, final ranking, and synthesis.
+The backend crawls and normalizes paper metadata, acquires and caches full text, runs TASTE-style external Claude readers by default, validates reading artifacts, and maintains resumable workflow state. Codex handles research scoping, source selection, title-and-abstract scoring, final ranking, and synthesis.
 
 ## Quick start
 
@@ -49,9 +49,35 @@ Or:
 $recommend-papers Find and deeply compare recent papers on retrieval-augmented agents for scientific discovery. Recommend 15 papers and explain which methods are most reusable.
 ```
 
-The user does not need to specify time or sources. When both are omitted, the skill applies its mandatory defaults and lets Codex select additional high-value channels.
+The user does not need to specify every setting. For a comprehensive review, omitted settings use the documented defaults. For a focused question or follow-up, Codex may choose a smaller justified scope, reuse prior run artifacts and caches, and stop as soon as the requested evidence is sufficient.
 
-### 4. Run diagnostics (optional)
+### 4. Enable Claude deep reading (optional)
+
+Claude is optional. When an authenticated `claude` CLI is available, the skill uses the first deep-reading method by default: one fresh external Claude process per paper, with a continuously refilled maximum of 16 simultaneous processes and one validated Chinese reading artifact per paper.
+
+Install/configure Claude CLI separately, then use either its normal login or an API key supported by your Claude CLI installation. The backend recognizes `ANTHROPIC_API_KEY` or a successful `claude auth status --json` result. For large reading jobs, API charges can grow quickly because every paper is a separate Claude call. Prefer a lower-cost API plan/model with a clear spending limit, and test a small paper count before reading 100 papers.
+
+Optional cost controls:
+
+```bash
+export ANTHROPIC_API_KEY='your-api-key'
+export CLAUDE_MODEL='your-provider-supported-lower-cost-model'
+export CLAUDE_MAX_BUDGET_USD='your-per-paper-limit'
+```
+
+`CLAUDE_MODEL` is passed to `claude --model`. `CLAUDE_MAX_BUDGET_USD` is passed to `claude --max-budget-usd` for each paper process, so it is a per-paper ceiling rather than a whole-run ceiling. Never commit API keys to this repository.
+
+Verify availability with the `doctor` command in step 5. Its `claude.available` field must be `true` before the default method is dispatched.
+
+If you do not want to configure or pay for Claude, say:
+
+```text
+Do not use Claude for deep reading in this conversation. Use exactly three Codex subagents to read three balanced paper batches directly.
+```
+
+That choice remains active throughout the current Codex conversation until you explicitly ask to use Claude again. See [Choose the deep-reading method](#choose-the-deep-reading-method) for the exact behavior of both methods.
+
+### 5. Run diagnostics (optional)
 
 macOS:
 
@@ -97,33 +123,51 @@ In PowerShell, use `& $python $service cache-status`.
 
 ## Default behavior
 
+Defaults are fallbacks rather than minimums. Each turn may independently customize research mode, sources, dates, categories, shortlist/recommendation counts, cache policy, reading backend, scoring priorities, output language, and stopping stage. Follow-up directions can create child runs that link prior evidence without copying or mutating it.
+
 - Metadata shortlist for full-text acquisition and deep reading: 100 papers.
 - Final recommendations: 20 papers.
 - Conferences: the latest single year with complete usable metadata for NeurIPS, ICLR, and ICML.
+- Built-in conference coverage also includes SIGKDD/KDD, SIGIR, CIKM, AAAI, ICCV, WWW, CVPR, ACL, IJCAI, ECCV, and EMNLP. Conference metadata uses the corresponding official live channel and is accepted only when the complete title-and-abstract corpus is verified. The current/requested year is actually probed across proceedings, accepted-paper pages, OpenReview, virtual sites, OJS, and indexes before any older-year fallback; a future release date alone never suppresses crawling.
 - arXiv: the trailing six calendar months, inclusive, across `cs.AI`, `cs.LG`, `stat.ML`, `cs.CL`, `cs.CV`, `cs.IR`, `cs.RO`, `eess.SY`, `cs.MA`, and `cs.NE` unless the user explicitly supplies categories.
 - Topic-adaptive sources: one to three additional sources selected by Codex.
-- Full-text download workers: 8.
-- Per-paper reading: one dedicated Codex subagent per acquired full text, using the maximum available Codex subagent concurrency.
+- Full-text download workers: 8 globally. Different APIs and official hosts run concurrently; every channel has its own concurrency slots, request interval, and cooldown. Same-channel capacity is source-specific and can be overridden with `RECOMMEND_PAPERS_HTTP_CONCURRENCY`. OpenReview defaults to one shared slot and cannot exceed three; official-client login/API/attachment and direct PDF/HTML requests share this gate. Papers deferred by 429/403/challenge are labeled temporary, then retried once through a single recovery worker after the shared cooldown instead of being reported as having no PDF.
+- Reading defaults to one fresh external Claude CLI process per paper through a continuously refilled pool capped at 16 simultaneous processes. If Claude is unavailable or explicitly disabled, exactly three Codex subagents directly read three balanced paper batches without per-paper artifacts.
 
 Users may override the shortlist count, final recommendation count, explicit sources, categories, date range, and ranking priorities in the request.
+
+## Choose the deep-reading method
+
+The skill supports exactly two deep-reading methods:
+
+1. **External Claude per paper (default).** Each paper is assigned to a fresh external Claude CLI process that follows the original TASTE Reading contract. At most 16 Claude processes run simultaneously; each completion immediately starts the next queued paper. Every paper produces its own validated Chinese `read.md` and receipt, so this method provides the strongest per-paper audit trail.
+2. **Three direct Codex batches.** Use this when Claude is unavailable or the user explicitly rejects the first method. All papers are divided as evenly as possible across exactly three Codex subagents. Each subagent directly reads every PDF in its assigned batch as quickly as practical. This mode does not run the per-paper Claude workflow and does not create per-paper `read.md` artifacts; it favors lower waiting time under Codex's three-subagent limit.
+
+To disable the first method for the current Codex conversation, say:
+
+```text
+Do not use Claude for deep reading in this conversation. Use exactly three Codex subagents to read three balanced paper batches directly.
+```
+
+Chinese instructions such as `本次对话不要使用 Claude 精读，全部改用三个 Codex subagent 分批直接阅读` or simply `不要用第一种精读方法` have the same effect. This preference remains active across every later question, changed research direction, continuation, and child run in the same Codex conversation. Silence in a later turn does not restore Claude. To switch back, explicitly say `Use Claude for deep reading again for the rest of this conversation` or `后续重新使用 Claude 精读`. A separate new Codex conversation has no access to the preference from this one.
 
 ## Workflow
 
 1. `doctor` verifies the Python version, dependencies, private paths, OpenReview mode, and backend health.
 2. `migrate-metadata-cache` normalizes cache layout and removes legacy or unproven cache artifacts.
-3. `init-run` creates one persistent run under the XDG state root.
+3. `init-run` creates one persistent run; follow-ups may pass a parent run, research mode, and new question.
 4. Codex interprets the research request, resolves dates and channels, and writes `plan.json`.
 5. `metadata` exhaustively acquires or reuses metadata and writes one receipt per source plus `metadata.json`.
 6. Codex scores every paper using title and abstract only. `shortlist` validates complete score coverage and selects the top 100 by default.
 7. `fulltext` downloads and validates every shortlisted paper it can acquire, preserving identity across fallbacks and caching successful artifacts.
-8. `prepare-reads` restores revision-matched reading caches and creates a queue for uncached papers.
-9. Codex dispatches exactly one dedicated subagent per pending paper. Each subagent reads the exact full text and writes a Chinese single-paper `read.md` plus a cryptographically bound receipt.
-10. `validate-reads` checks titles, required sections, Chinese content, formulas, lengths, full-text hashes, complete abstract-translation mapping, distinctness, and subagent audit fields. It then creates the aggregate `read.md`.
+8. Default mode runs `prepare-reads`, then `claude-reads`; up to 16 external Claude processes run at once and each completion immediately starts the next paper. Each paper writes a Chinese `read.md` and bound receipt.
+9. `validate-reads` validates those Claude artifacts and permits one parallel fresh-Claude repair pass for failures.
+10. If Claude is unavailable or forbidden, `prepare-fast-read-batches` creates exactly three balanced manifests and Codex sends exactly three direct batch-reading subagents; this skips the preceding per-paper artifact path.
 11. Codex produces a full-text evidence card and new two-dimensional score for every acquired paper.
 12. `finalize` validates complete evidence coverage and arithmetic, reranks all deeply read papers, and selects the top 20 by default.
 13. Codex writes the cross-paper synthesis. `complete` verifies the final artifacts and marks the run complete.
 
-The backend blocks downstream stages when metadata coverage, score coverage, single-paper reads, evidence cards, paths, hashes, or upstream fingerprints are incomplete or stale.
+The stages are composable: metadata-only, shortlist, full-text, reading, and recommendation endpoints are supported. The backend blocks only the requirements of the selected endpoint and prevents stale or mismatched evidence reuse.
 
 ## Storage and cache layout
 
@@ -189,7 +233,7 @@ skills/recommend-papers/
 - `SKILL.md` controls Codex behavior and the mandatory workflow.
 - `references/` contains defaults, scoring rules, migration semantics, and the service contract.
 - `scripts/recommend_service/` is the deterministic crawler, cache, acquisition, validation, and state backend.
-- Codex coordinates the workflow and its dedicated subagents produce the validated per-paper analyses used for final ranking.
+- Codex coordinates the workflow; external Claude processes produce default per-paper analyses, while the no-Claude fallback uses exactly three direct Codex batch readers.
 
 ## License
 
@@ -250,7 +294,33 @@ $recommend-papers 调研最近两年的多模态RAG论文，深读前50篇，最
 
 用户不必指定时间和渠道。两者都没有指定时，skill会应用强制默认范围，并让Codex选择额外的高价值渠道。
 
-### 4. 运行诊断（可选）
+### 4. 启用Claude精读（可选）
+
+Claude不是必需依赖。安装并认证`claude` CLI后，skill默认使用第一种精读方式：每篇论文启动一个全新的外部Claude进程，最多同时运行16个，并为每篇论文生成经过验证的中文精读产物。
+
+请单独安装和配置Claude CLI，可以使用正常登录，也可以使用当前Claude CLI支持的API密钥。后端会识别`ANTHROPIC_API_KEY`，或者以`claude auth status --json`的成功结果判断Claude可用。大量论文会产生大量独立Claude调用，阅读100篇时费用可能很明显。最好选择价格较低、额度和账单上限清晰的API套餐或模型，并先用少量论文试运行，再扩大到100篇。
+
+可以设置以下成本控制项：
+
+```bash
+export ANTHROPIC_API_KEY='你的API密钥'
+export CLAUDE_MODEL='你的API支持的低成本模型标识'
+export CLAUDE_MAX_BUDGET_USD='每篇论文允许的美元上限'
+```
+
+`CLAUDE_MODEL`会传给`claude --model`；`CLAUDE_MAX_BUDGET_USD`会传给每个论文进程的`claude --max-budget-usd`，因此它限制的是每篇论文，而不是整个任务的总费用。不要把API密钥提交到本仓库。
+
+使用第5步的`doctor`检查Claude状态；只有输出中的`claude.available`为`true`时，系统才会启动默认Claude精读。
+
+如果不想配置或付费使用Claude，直接说：
+
+```text
+本次对话不要使用 Claude 精读，全部改用三个 Codex subagent 分批直接阅读。
+```
+
+该选择会在当前整个Codex对话中持续生效，直到用户明确要求恢复Claude精读。两种方式的完整差异见[选择精读方式](#选择精读方式)。
+
+### 5. 运行诊断（可选）
 
 macOS：
 
@@ -296,33 +366,51 @@ PowerShell中使用`& $python $service cache-status`。
 
 ## 默认设置
 
+默认值只是未指定设置的兜底值，不是最低要求。每一轮都可分别调整研究模式、渠道、日期、分类、初筛/推荐数量、缓存策略、阅读后端、评分重点、输出语言和停止阶段。后续方向可以创建链接上一轮证据的子任务，不复制或修改上一轮产物。
+
 - 进入全文下载和精读的元数据前100篇。
 - 最终推荐前20篇。
 - 会议为最新完整可用年份的 NeurIPS、ICLR、ICML。
+- 内置会议还包括 SIGKDD/KDD、SIGIR、CIKM、AAAI、ICCV、WWW、CVPR、ACL、IJCAI、ECCV、EMNLP；分别使用对应官方实时渠道，只有完整标题与摘要全集通过验证后才会写入年度缓存。系统会先实际探测当年/指定年份的论文集、accepted-papers、OpenReview、virtual、OJS 和索引渠道，再考虑回退旧年份；未来发布日期本身绝不会阻止爬取。
 - arXiv 为最近六个日历月，默认分类包括 `cs.AI`、`cs.LG`、`stat.ML`、`cs.CL`、`cs.CV`、`cs.IR`、`cs.RO`、`eess.SY`、`cs.MA`、`cs.NE`。
 - Codex根据主题增加1–3个渠道。
-- 全文下载默认8个worker。
-- 每篇全文分配一个独立Codex subagent，并使用当前运行环境允许的最大subagent并发度。
+- 全文下载默认全局8个worker；不同API和官方主机可同时运行，各渠道独立限制并发、请求间隔和冷却。同渠道容量按来源配置，也可通过 `RECOMMEND_PAPERS_HTTP_CONCURRENCY` 覆盖。OpenReview默认只使用1个共享槽位，且无论如何不超过3；官方client登录/API/附件与PDF/HTML直链共用同一门控和冷却。因429、403或challenge延期的论文会标记为暂时失败，并在冷却后由1个恢复worker自动重试一次，不会被表述为“没有PDF”。
+- 默认每篇全文使用一个全新的外部Claude CLI进程，但同时最多运行16个；任一进程完成后立即补入下一篇。Claude不可用或用户明确禁用时，恰好启动三个Codex subagent，直接阅读平均分配的三批论文，不生成逐篇产物。
 
 用户可在请求中覆盖初筛数量、最终推荐数量、渠道、分类、日期和排名侧重点。
+
+## 选择精读方式
+
+本skill只支持以下两种精读方式：
+
+1. **逐篇外部Claude精读（默认）。** 每篇论文启动一个全新的外部Claude CLI进程，完全执行原TASTE Reading的单篇精读规范；同时最多运行16个Claude，任一完成后立即补入下一篇。每篇分别生成经过验证的中文`read.md`和回执，逐篇可审计性最强。
+2. **三个Codex subagent直接分批阅读。** Claude不可用或用户明确拒绝第一种方式时使用。系统把全部待读论文尽量平均分成三份，恰好交给三个Codex subagent；每个subagent直接、尽快阅读自己那批PDF。此方式不执行逐篇Claude流程，也不生成逐篇`read.md`，目的是在Codex只能三路并发时减少等待时间。
+
+如果不想使用第一种精读方式，推荐直接对Codex说：
+
+```text
+本次对话不要使用 Claude 精读，全部改用三个 Codex subagent 分批直接阅读。
+```
+
+说`不要用第一种精读方法`或`不要用Claude精读`也会触发同一设置。该要求默认对当前整个Codex对话持续有效，包括后续追问、切换研究方向、继续原run和创建child run；后面的消息没有再次提到Claude，不代表取消该设置。只有用户明确说`后续重新使用 Claude 精读`，Codex才可以恢复第一种方式。如果只想临时禁用一轮，必须明确说`仅这一轮不要用Claude精读`。新建的另一个Codex对话不会自动继承本对话偏好。
 
 ## 完整工作流程
 
 1. `doctor` 检查Python版本、依赖、外部存储路径、OpenReview访问模式和后端健康状态。
 2. `migrate-metadata-cache` 统一缓存布局并删除旧式或没有完整性证明的缓存。
-3. `init-run` 在XDG state目录创建一个持久任务。
+3. `init-run` 在XDG state目录创建一个持久任务；追问可传入父任务、研究模式和新问题。
 4. Codex理解研究要求，确定日期、主题和渠道，并写入 `plan.json`。
 5. `metadata` 全量抓取或复用各来源元数据，生成逐来源回执和 `metadata.json`。
 6. Codex仅根据标题和摘要为所有论文评分；`shortlist` 验证评分覆盖率并默认选择前100篇。
 7. `fulltext` 获取并验证候选全文，保证fallback过程中的论文身份一致，并缓存成功产物。
-8. `prepare-reads` 恢复与当前全文版本匹配的阅读缓存，对未缓存论文生成队列。
-9. Codex为每篇待阅读论文分配一个独立subagent；subagent读取精确全文，写中文单篇 `read.md` 和哈希绑定回执。
-10. `validate-reads` 检查标题、章节、中文、公式、长度、全文哈希、完整摘要翻译映射、论文间内容独立性和subagent审计字段，然后生成汇总 `read.md`。
+8. 默认执行 `prepare-reads` 和 `claude-reads`；后者使用最多16个并发槽位流水执行，每完成一篇就启动下一篇，逐篇写中文 `read.md` 和哈希绑定回执。
+9. `validate-reads` 验证Claude产物，并允许对失败论文进行一次全新Claude并行修复。
+10. Claude不可用或被明确禁用时，改执行 `prepare-fast-read-batches`，生成恰好三份均衡清单，再由Codex启动恰好三个subagent直接批量阅读；此分支跳过逐篇产物流程。
 11. Codex为每篇全文可用论文生成证据卡，并根据全文重新进行两维评分。
 12. `finalize` 验证证据覆盖率和分数算术，重新排名所有深读论文，默认选择前20篇。
 13. Codex撰写跨论文综合报告；`complete` 验证最终产物并把任务标记为完成。
 
-任何来源覆盖、初筛评分、单篇阅读、证据卡、路径、哈希或上游fingerprint不完整时，后端都会阻止进入后续阶段。
+元数据、初筛、全文、阅读和推荐都可以作为有意的结束阶段；后端只校验当前所选终点的必要条件，同时阻止过期或错配证据被复用。
 
 ## 中间状态与缓存
 

@@ -1,15 +1,46 @@
 {
   "metadata_shortlist": 100,
   "final_recommendations": 20,
+  "defaults_are_fallbacks_not_minimums": true,
+  "workflow_profiles": {
+    "comprehensive": {"stop_after": "recommendation", "shortlist_target": 100, "final_target": 20},
+    "focused": {"counts": "chosen_by_codex_for_current_question", "stop_after": "smallest_sufficient_stage"},
+    "incremental": {"reuse_parent_artifacts": true, "search_only_evidence_gap": true},
+    "metadata_only": {"stop_after": "metadata_or_shortlist", "fulltext_required": false}
+  },
   "cache_policy": "reuse",
   "fulltext_workers": 8,
+  "http_channel_concurrency": {
+    "arxiv": 1,
+    "openreview": 1,
+    "openreview_hard_ceiling": 3,
+    "acm": 1,
+    "semantic_scholar": 2,
+    "openalex": 4,
+    "dblp": 4,
+    "default_host": 2,
+    "host-aclanthology.org": 6,
+    "host-openaccess.thecvf.com": 6,
+    "environment_override": "RECOMMEND_PAPERS_HTTP_CONCURRENCY",
+    "cooldown_requeue_wait_cap_seconds": 180,
+    "cooldown_requeue_workers": 1
+  },
   "deep_read_parallelism": {
-    "mode": "maximum_available_codex_subagents",
-    "papers_per_subagent": 1,
-    "refill_slots_until_queue_empty": true
+    "default_mode": "one_external_claude_process_per_paper",
+    "claude_processes": "one_fresh_process_per_reading_paper",
+    "max_concurrency": 16,
+    "scheduling": "bounded_pipeline_refill_on_completion",
+    "fallback_when": ["claude_unavailable", "user_explicitly_disables_claude"],
+    "fallback_mode": "exactly_three_direct_codex_batch_subagents",
+    "fallback_batch_count": 3,
+    "fallback_per_paper_artifacts": false,
+    "user_disabled_claude_default_scope": "conversation",
+    "user_disabled_claude_is_sticky": true,
+    "user_silence_clears_preference": false,
+    "explicit_reenable_required": true
   },
   "single_paper_read": {
-    "required_for_every_acquired_full_text": true,
+    "required_for_every_acquired_full_text_in_default_claude_mode": true,
     "language": "zh-CN",
     "cache_by_full_text_sha256": true
   },
@@ -44,7 +75,7 @@
     }
   ],
   "adaptive_channel_selection": {
-    "required": true,
+    "required_in_comprehensive_default_scope": true,
     "minimum_additional_channels": 1,
     "maximum_additional_channels": 3,
     "record_decisions": true,

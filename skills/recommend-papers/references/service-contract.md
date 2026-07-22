@@ -38,7 +38,15 @@ final_ranking.json
 recommendations.md
 ```
 
-`run.json` tracks the active stage and counts. Only `complete` sets its status to `complete`.
+`run.json` tracks the active stage and counts. `complete` closes recommendation workflows; `finish-stage` closes an intentional partial workflow after validating its selected endpoint.
+
+## Multi-turn and partial workflows
+
+`init-run` accepts optional `--parent-run-dir`, `--mode`, and `--question`. A child run records links to available parent artifacts in `continuation.json` but never copies or mutates them. Shared caches provide cross-run reuse. Use the same run for a same-scope follow-up while it remains active; create a child for a materially different question, corpus, date window, or ranking objective.
+
+Every metadata plan may include `workflow.mode` (`comprehensive`, `focused`, `incremental`, `metadata_only`), `research_question`, `rationale`, `stop_after`, `reading_preference`, `shortlist_target`, and `final_target`. A missing workflow preserves the prior behavior: no user-specified time/channels implies comprehensive defaults. A non-comprehensive workflow requires a concrete question and rationale, then may choose a narrower source/date/count configuration. This is an explicit scoped claim, not exhaustive coverage. When `codex_fast` comes from an explicit user refusal of Claude, normalization adds `reading_preference_scope: conversation` and `conversation_reading_preference_locked: true` unless the user explicitly limited the choice to the current turn. Every later plan in the same Codex conversation must copy this lock until the user explicitly re-enables Claude.
+
+The backend stages are composable. `finish-stage` validates and closes intentional endpoints at metadata, shortlist, fulltext, or reading. `finalize`/`complete` are required only for ranking/recommendation endpoints. Defaults are used only for unspecified settings and are never enforced as minimum paper counts.
 
 ## Sources
 
@@ -46,7 +54,7 @@ Supported metadata types:
 
 - `arxiv`: Atom API; requires concrete `start_date` and `end_date`. It forbids result limits. The default category set is `cs.AI`, `cs.LG`, `stat.ML`, `cs.CL`, `cs.CV`, `cs.IR`, `cs.RO`, `eess.SY`, `cs.MA`, and `cs.NE`; explicit user categories override it. `cs.CL` and `cs.CV` cover NLP and vision, while `cs.RO` plus `eess.SY` cover embodied-intelligence robotics and control. The backend performs exhaustive server-side category/date pagination and stores complete category/day shards. Task keywords never narrow this base crawl.
 - `biorxiv`: official bioRxiv API; requires concrete dates and forbids result limits. Acquisition is exhaustive and all-category; task queries/categories are recorded but ignored until Codex metadata scoring.
-- `venue`: `venue_id` from `catalog`, or a custom DBLP/OpenReview venue; requires exactly one year and `complete_catalog: true`. Limits, topic queries, categories, tracks, and samples are forbidden at acquisition time. OpenReview paginates until its final page; DBLP reads the complete venue-volume XML rather than its capped search API. Only after this complete pool is cached may Codex rank all papers from titles and abstracts and select the default 100.
+- `venue`: `venue_id` from `catalog`, or a custom DBLP/OpenReview venue; requires exactly one year and `complete_catalog: true`. Limits, topic queries, categories, tracks, and samples are forbidden at acquisition time. The built-in catalog supports the complete 14-venue TASTE set: NeurIPS/NIPS, ICLR, ICML, SIGKDD/KDD, SIGIR, CIKM, AAAI, ICCV, WWW, CVPR, ACL, IJCAI, ECCV, and EMNLP. It uses OpenReview, CVF Open Access, ACL Anthology, AAAI OJS, IJCAI proceedings, ECVA, or ACM/indexed enrichment according to the original source policy. DBLP title records for a priority venue are seeds/cross-checks only and can never prove full metadata without abstracts. Only after the complete title-and-abstract pool is cached may Codex rank all papers and select the default 100.
 - `journal`, `nature`, `science`: Crossref, optionally filtered by journal names and queries.
 
 Baseline IDs are `neurips`, `iclr`, and `icml`. A custom venue can use:
@@ -61,13 +69,13 @@ or:
 {"type":"venue","adapter":"openreview","venue":"ICLR","openreview_venue_id":"ICLR.cc/2026/Conference","years":[2026],"complete_catalog":true}
 ```
 
-Every plan must consider NeurIPS/NIPS, ICLR, ICML, and arXiv in `channel_decisions`. Venue sources require one resolved year; preprint sources require concrete dates.
+Every comprehensive plan must consider NeurIPS/NIPS, ICLR, ICML, and arXiv in `channel_decisions`; focused and incremental plans record only channels actually considered for their evidence gap. Venue sources require one resolved year; preprint sources require concrete dates. Resolution probes the requested/current year through every configured live adapter before falling back; release calendars are informational and never suppress a real request.
 
-Every plan declares `request_scope.user_specified_time`, `request_scope.user_specified_channels`, and `request_scope.as_of_date`. When both user flags are false, validation requires NeurIPS/NIPS, ICLR, and ICML at their respective latest usable complete-metadata years, exactly one arXiv source over the inclusive trailing six calendar months, and one to three additional topic-adaptive sources. Adaptive conferences use their latest usable year; adaptive non-conference streams use the identical six-month start/end dates.
+Every plan declares `request_scope.user_specified_time`, `request_scope.user_specified_channels`, and `request_scope.as_of_date`. In comprehensive mode, when both user flags are false, validation requires NeurIPS/NIPS, ICLR, and ICML at their respective latest usable complete-metadata years, exactly one arXiv source over the inclusive trailing six calendar months, and one to three additional topic-adaptive sources. Adaptive conferences use their latest usable year; adaptive non-conference streams use the identical six-month start/end dates. Focused, incremental, and metadata-only modes may narrow this scope when their recorded question and rationale justify it.
 
 Only one metadata crawl may write a run at a time. Cross-process locks must retain this behavior on Windows, macOS, and Linux. A live command session must be resumed until its final exit status, not treated as termination. bioRxiv receipts explicitly expose `server_total`, `server_total_scanned`, `exhausted`, `truncated`, `next_cursor`, and `exhaustion_proof`; truncated coverage blocks shortlisting. Shortlist, full-text, final-ranking, and completion artifacts are bound to upstream fingerprints and stale artifacts are rejected after any metadata change.
 
-The shared HTTP client serializes each service across threads and Codex processes, preserves persisted cooldown state, and honors `Retry-After`. arXiv uses a 5.1-second minimum interval and up to eight attempts for 429/5xx responses; other services retain their configured retry policy. These responses remain internal transient events until retry exhaustion; Codex must not present an intermediate attempt as a confirmed source failure.
+The shared HTTP client gives every API or official host an independent cross-thread and cross-process slot pool, minimum start interval, and persisted cooldown while honoring `Retry-After`. Unrelated channels never share a slot or cooldown. The global full-text worker count bounds aggregate downloads; per-channel capacity independently limits one source according to observed behavior. `RECOMMEND_PAPERS_HTTP_CONCURRENCY` may provide a JSON map of service/host overrides. arXiv uses one slot, a 5.1-second minimum interval, and up to eight attempts for 429/5xx responses; challenge-prone ACM also defaults to one slot. OpenReview defaults to one slot and has a non-overridable ceiling of three. All openreview-py client construction/login, venue-note pagination, attachment calls, and direct OpenReview HTTP/PDF/HTML requests enter the same process-safe `openreview` gate and write 429/403 cooldowns to the same state. Other services retain their configured retry policy, including bounded connection/TLS retries. These responses remain internal transient events until retry exhaustion; Codex must not present an intermediate attempt as a confirmed source failure.
 
 ## Metadata cache
 
@@ -101,23 +109,27 @@ Codex must score every identity in `metadata.json`:
 }
 ```
 
-`shortlist` validates complete coverage and arithmetic, sorts deterministically, and selects the requested target (default 100). Metadata scoring is deliberately limited to title-and-abstract scientific evidence. Only selected papers are passed to full-text acquisition, dedicated per-paper Codex subagents, and final full-text scoring.
+`shortlist` validates complete coverage and arithmetic, sorts deterministically, and selects the requested target (default 100). Metadata scoring is deliberately limited to title-and-abstract scientific evidence. Only selected papers are passed to full-text acquisition and the selected reading mode.
 
 ## Full-text cache and resume
 
-Candidate order is the official OpenReview attachment API (authenticated when credentials exist, otherwise anonymous), metadata PDF, arXiv/OpenReview public PDF fallback, OpenAlex/Unpaywall OA PDF, same-paper HTML, and Europe PMC XML. OpenReview attachment retrieval uses `openreview-py`; receipts distinguish authentication failure, missing attachment, public-endpoint `challenge_403`, parse failure, and identity mismatch. PDF text is extracted with PyMuPDF. A result is ready only when it has at least 1200 characters, body-section markers, and title/author identity evidence.
+Candidate order is the official OpenReview attachment API (authenticated when credentials exist, otherwise anonymous), deterministic official conference PDF, metadata PDF, arXiv/OpenReview public PDF fallback, DOI-based OpenAlex/Unpaywall OA PDF, exact-title Semantic Scholar/HAL/arXiv public copy, same-paper HTML, and Europe PMC XML. The OpenReview client tries `pdf` and then `originally_submitted_PDF`. Optional OA indexes are queried only after supplied and official locators fail; an active optional-service cooldown is recorded and skipped. Exact-title lookup requires equal normalized titles and every resulting PDF still passes title/author and paper-body validation. PDF identity is checked against title-like windows in the first-page front matter plus author-family overlap, rather than accepting title words found anywhere in the body or references. OpenReview receipts distinguish authentication failure, missing attachment, public-endpoint `challenge_403`, parse failure, and identity mismatch. PDF text is extracted with PyMuPDF. A result is ready only when it has at least 1200 characters, body-section markers, and title/author identity evidence.
 
-Successful artifacts are cached under `cache/fulltext/<identity-hash>/`. Identity prefers DOI, arXiv ID, OpenReview ID, or PMCID; title fallback includes first author and year. Run resume checks identity, not only list index. Failed acquisition receipts remain in the run.
+Successful artifacts are cached under `cache/fulltext/<identity-hash>/`. Identity prefers DOI, arXiv ID, OpenReview ID, or PMCID; title fallback includes first author and year. Both cache keys and run-resume receipts bind the acquisition-contract version, so an identity-validation upgrade cannot reuse an artifact accepted under weaker rules. Run resume checks identity, not only list index. Failed acquisition receipts remain in the run. A 429, active shared cooldown, or 403/challenge produces `temporarily_unavailable` with `retryable_after_cooldown: true`, not a permanent absence claim. After the parallel acquisition pass, the coordinator waits up to `RECOMMEND_PAPERS_COOLDOWN_REQUEUE_WAIT_CAP_SECONDS` (180 seconds by default) for the relevant service cooldown and retries every deferred paper exactly once, serially. The run-level `cooldown_requeue` receipt records eligible, attempted, recovered, skipped, and waited counts.
 
-## Single-paper read artifacts
+## Reading modes
 
-Run `prepare-reads` after full-text acquisition. Each ready paper receives `papers/<index>/read.md`; `reading_queue.json` lists restored and pending artifacts. A cached read is restored only when its stored full-text SHA-256 equals the current text.
+External Claude is the default. `doctor` reports the resolved Claude CLI without making it a required Python dependency. After `prepare-reads`, `claude-reads` gives every pending paper a fresh external Claude process through a bounded pipeline. The hard concurrency ceiling is 16; `--workers` may lower it but cannot raise it. Completion of any process immediately frees a slot for the next paper, so 100 papers run as a continuously refilled 16-slot queue rather than 100 resident processes. Each command uses `claude -p --permission-mode bypassPermissions --output-format json`, disables `Agent`, `Task`, and worktree tools, and receives only one paper prompt. This pool is independent of Codex subagent capacity. If set, `CLAUDE_MODEL` is passed through `--model` and positive `CLAUDE_MAX_BUDGET_USD` through `--max-budget-usd`; the latter is a per-paper process ceiling, not a whole-run budget.
+
+When Claude cannot be resolved, `claude-reads` returns `status: claude_unavailable` and performs no reading. When that occurs—or when the user explicitly forbids Claude—`prepare-fast-read-batches` writes exactly three balanced manifests. Exactly three Codex subagents directly read their entire assigned batches and return batch evidence. This fast branch bypasses all single-paper Markdown, receipt, translation-map, repair, and read-cache machinery. `finalize` instead requires exact full-text paths, correct batch IDs, complete paper coverage, scientific fields, and valid score arithmetic. No other Claude failure automatically authorizes this lower-audit fallback.
+
+## Default Claude single-paper artifacts
+
+Run `prepare-reads` after full-text acquisition. Each ready paper receives `papers/<index>/read.md`; `reading_queue.json` lists restored and pending artifacts. Every pending item also has a deterministic `papers/<index>/read_prompt.md` and exposes its absolute `prompt_path`, so concurrently dispatched agents receive identical whole-text, output-scope, Markdown, translation, receipt, and hash requirements. A cached read is restored only when its stored full-text SHA-256 equals the current text.
 
 Each pending read must contain the exact title as H1, two metadata bullets (`来源`, `论文链接`), and these H2 sections in order: `摘要`, `动机与核心创新`, `方法`, `实验结果`, `优缺点总结`. The abstract is substantive Chinese, must not copy long English prose, and must preserve a supplied `abstract_zh` verbatim. Motivation/innovation includes `动机：` and `核心创新：` with 200–250 Chinese characters. Method uses 300–400 Chinese characters plus a relevant LaTeX formula and explanation. Experiments use at most 150 Chinese characters. Strengths/limitations use at most 100 Chinese characters. LaTeX commands outside math delimiters and malformed delimiters are rejected.
 
-Each pending queue item supplies `receipt_path`, the source abstract, and the full-text SHA-256. A dedicated Codex subagent writes `read.md` plus `read_receipt.json`. Matching original Reading semantics, the receipt must report `status=complete`, `subagent_deep_read=true`, and `deep_read_audit.mode=dedicated_codex_subagent`, `subagent_used=true`, the exact `text_path`, `evidence_chars` at least the extracted full-text character count, the exact `article_markdown_path`, and `article_markdown_written=true`. Integrity enhancements additionally bind full-text/source-abstract/read SHA-256 values and provide one `{source_sha256, translation_zh}` entry per original abstract sentence.
-
-The main Codex dispatches exactly one pending paper per dedicated subagent, fills the maximum number of subagent slots exposed by its current runtime, and immediately refills completed slots until the queue is empty. A fixed agent count is intentionally not hard-coded because runtime concurrency limits vary. All dispatched agents must finish and yield distinct validated artifacts before final ranking.
+Each pending queue item is self-contained for one paper: identity, title, authors, source/date, canonical paper URL, the accepted remote PDF URL, local PDF path when retained, run directory, exact `full_text_path`, output `read_path`/`receipt_path`, source abstract, and full-text/source-abstract SHA-256 values. One external Claude process receives that item and writes `read.md` plus `read_receipt.json`. Matching original Reading semantics, the receipt must report `status=complete`, `subagent_deep_read=true`, and `deep_read_audit.mode=dedicated_claude_subagent`, `subagent_used=true`, the exact `text_path`, `evidence_chars` at least the extracted full-text character count, the exact `article_markdown_path`, and `article_markdown_written=true`. Integrity enhancements additionally bind full-text/source-abstract/read SHA-256 values and provide one `{source_sha256, translation_zh}` entry per original abstract sentence.
 
 Minimal receipt shape:
 
@@ -132,7 +144,7 @@ Minimal receipt shape:
   "subagent_deep_read": true,
   "abstract_sentence_map": [{"source_sha256": "...", "translation_zh": "..."}],
   "deep_read_audit": {
-    "mode": "dedicated_codex_subagent",
+    "mode": "dedicated_claude_subagent",
     "subagent_used": true,
     "full_text_sha256": "...",
     "source_abstract_sha256": "...",
@@ -145,11 +157,11 @@ Minimal receipt shape:
 }
 ```
 
-`validate-reads` rejects malformed, too-short, non-Chinese, formula-free, wrong-title, unaudited, or stale-contract artifacts. On success it writes `read_artifacts.json`, aggregates all reads to `<run-dir>/read.md`, and caches each read and receipt under `cache/fulltext/<identity-hash>/reading/` with its full-text fingerprint and reading-contract version. A version change invalidates old reading caches without deleting full-text caches.
+`validate-reads` rejects malformed, too-short, non-Chinese, formula-free, wrong-title, unaudited, or stale-contract artifacts. `claude-reads --only-failed` gives each failed paper one fresh external Claude process for one minimal repair pass through the same maximum-16 pipeline. On success the validator writes `read_artifacts.json`, aggregates all reads to `<run-dir>/read.md`, and caches each read and receipt under `cache/fulltext/<identity-hash>/reading/` with its full-text fingerprint and reading-contract version. A version change invalidates old reading caches without deleting full-text caches.
 
 ## Evidence card
 
-Write one JSON object per line for every `full_text_available: true` item:
+Write one JSON object per line for every `full_text_available: true` item. Default Claude mode uses `read_path`; the fast fallback replaces it with the assigned `batch_id`:
 
 ```json
 {
@@ -168,4 +180,4 @@ Write one JSON object per line for every `full_text_available: true` item:
 }
 ```
 
-`finalize` rejects missing/duplicate/foreign cards, missing validated reads, incorrect full-text/read paths, missing scientific fields, and incorrect arithmetic. It creates the canonical final ranking and top-N set.
+`finalize` rejects missing/duplicate/foreign cards, incorrect full-text paths, missing scientific fields, and incorrect arithmetic. In default mode it additionally requires the validated `read_path`; in fast mode it instead requires the exact assignment from one of the three manifests. It creates the canonical final ranking and top-N set.

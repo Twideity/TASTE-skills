@@ -5,6 +5,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -15,30 +16,90 @@ import fitz
 from bs4 import BeautifulSoup
 
 from .credentials import openreview_settings
-from .http import get, receipt
+from .conference_sources import official_pdf_candidates
+from .http import cooldown_remaining, get, receipt, service_call, service_for
 from .metadata import clean, paper_identity
 from .storage import FULLTEXT_CACHE_ROOT, now_iso, read_json, safe_write_target, stable_hash, update_run, write_json, write_text
 
 
 MIN_FULL_TEXT_CHARS = 1200
+ACQUISITION_SCHEMA_VERSION = 2
 _cache_publish_lock = threading.Lock()
-_openreview_clients = threading.local()
+_openreview_client_lock = threading.Lock()
+_openreview_client_cache: dict[tuple[str, str], tuple[Any, dict[str, Any]]] = {}
 
 
 def _title_tokens(value: Any) -> set[str]:
-    stop = {"a", "an", "and", "for", "in", "of", "on", "the", "to", "with", "via", "using"}
-    return {token.lower() for token in re.findall(r"[A-Za-z0-9]+", clean(value)) if len(token) >= 3 and token.lower() not in stop}
+    stop = {"a", "an", "and", "for", "in", "of", "on", "the", "to", "toward", "towards", "with", "via", "using"}
+    normalized = re.sub(r"[\u2010-\u2015]", "-", clean(value))
+    return {token.lower() for token in re.findall(r"[A-Za-z0-9]+", normalized) if len(token) >= 2 and token.lower() not in stop}
+
+
+def _title_similarity(left: Any, right: Any) -> float:
+    left_tokens = _title_tokens(left)
+    right_tokens = _title_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / max(1, len(left_tokens | right_tokens))
+
+
+def _author_family_tokens(value: Any) -> set[str]:
+    names = [clean(item) for item in value] if isinstance(value, list) else re.split(r"[,;]", clean(value))
+    families = set()
+    for name in names:
+        parts = [part.lower() for part in re.findall(r"[A-Za-z][A-Za-z-]+", name)]
+        if parts:
+            families.add(parts[-1])
+    return families
+
+
+def _best_full_text_title(paper: dict[str, Any], text: str) -> tuple[str, float, int]:
+    """Find a title-like window before the abstract and bind it to author evidence."""
+    lines = []
+    for raw_line in str(text or "").splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()[:240].rstrip()
+        if not line:
+            continue
+        lower = line.lower()
+        if lower.startswith(("abstract", "references", "acknowledgments", "acknowledgements")):
+            break
+        if lower.startswith(("keywords", "introduction")) and lines:
+            break
+        lines.append(line)
+        if len(lines) >= 36:
+            break
+    if not lines:
+        return "", 0.0, 0
+    expected_title = clean(paper.get("title"))
+    best_title = ""
+    best_similarity = 0.0
+    for start in range(min(10, len(lines))):
+        for count in range(1, min(10, len(lines) - start) + 1):
+            candidate = " ".join(lines[start:start + count])
+            candidate = re.sub(r"([A-Za-z]{2,})-\s+([A-Za-z]{1,3})(?=\b)", r"\1\2", candidate)
+            candidate = re.sub(r"([A-Za-z])-\s+([A-Za-z])", r"\1 \2", candidate)
+            candidate = re.sub(r"\s+", " ", candidate).strip()
+            similarity = _title_similarity(expected_title, candidate)
+            if similarity > best_similarity:
+                best_title, best_similarity = candidate, similarity
+    expected_authors = _author_family_tokens(paper.get("authors"))
+    observed_tokens = {token.lower() for token in re.findall(r"[A-Za-z][A-Za-z-]+", " ".join(lines))}
+    author_overlap = len(expected_authors & observed_tokens)
+    return best_title, best_similarity, author_overlap
 
 
 def _identity_ok(paper: dict[str, Any], text: str) -> bool:
-    expected = _title_tokens(paper.get("title"))
-    if not expected:
+    if not _title_tokens(paper.get("title")):
         return False
-    observed = _title_tokens(text[:20000])
-    overlap = len(expected & observed) / max(1, len(expected))
-    authors = paper.get("authors") if isinstance(paper.get("authors"), list) else []
-    author_tokens = {token.lower() for author in authors[:3] for token in re.findall(r"[A-Za-z]{3,}", clean(author))}
-    return overlap >= 0.55 or (overlap >= 0.4 and bool(author_tokens & observed))
+    _, similarity, author_overlap = _best_full_text_title(paper, text)
+    expected_authors = _author_family_tokens(paper.get("authors"))
+    if not expected_authors:
+        return similarity >= 0.92
+    return (
+        (similarity >= 0.82 and author_overlap >= 1)
+        or (similarity >= 0.78 and author_overlap >= 2)
+        or (similarity >= 0.70 and author_overlap >= 4)
+    )
 
 
 def _body_ok(text: str) -> bool:
@@ -60,21 +121,31 @@ def _identifier(paper: dict[str, Any], name: str) -> str:
     return clean(identifiers.get(name) or paper.get(name))
 
 
+def _title_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", clean(value).lower())
+
+
 def _openreview_client():
     import openreview
 
     settings = openreview_settings()
-    client = getattr(_openreview_clients, "client", None)
     identity = (settings["username"], str(settings["env_file"]))
-    if client is None or getattr(_openreview_clients, "identity", None) != identity:
-        client = openreview.api.OpenReviewClient(
-            baseurl="https://api2.openreview.net",
-            username=settings["username"] or None,
-            password=settings["password"] or None,
-        )
-        _openreview_clients.client = client
-        _openreview_clients.identity = identity
-    return client, settings
+    with _openreview_client_lock:
+        cached_client = _openreview_client_cache.get(identity)
+        if cached_client is not None:
+            return cached_client[0], {**cached_client[1], "client_reused": True}
+
+        def create():
+            return openreview.api.OpenReviewClient(
+                baseurl="https://api2.openreview.net",
+                username=settings["username"] or None,
+                password=settings["password"] or None,
+            )
+
+        client, retry_history = service_call("openreview", create, max_attempts=5)
+        client_settings = {**settings, "client_reused": False, "login_retry_history": retry_history}
+        _openreview_client_cache[identity] = (client, client_settings)
+        return client, client_settings
 
 
 def _authenticated_openreview_pdf(paper: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
@@ -84,13 +155,41 @@ def _authenticated_openreview_pdf(paper: dict[str, Any]) -> tuple[bytes, dict[st
         return b"", {**attempt, "accepted": False, "reason": "openreview_id_missing"}
     try:
         client, settings = _openreview_client()
-        content = client.get_attachment(field_name="pdf", id=note_id)
-        attempt.update({"authenticated": settings["authenticated"], "content_length": len(content or b"")})
-        if not content:
-            return b"", {**attempt, "accepted": False, "reason": "attachment_not_available"}
-        if not content.startswith(b"%PDF"):
-            return b"", {**attempt, "accepted": False, "reason": "attachment_not_pdf"}
-        return content, attempt
+        failures = []
+        for field_name in ("pdf", "originally_submitted_PDF"):
+            try:
+                content, retry_history = service_call(
+                    "openreview",
+                    lambda: client.get_attachment(field_name=field_name, id=note_id),
+                    max_attempts=5,
+                )
+            except Exception as exc:
+                failures.append({
+                    "field_name": field_name,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc)[:300],
+                    "retry_history": list(getattr(exc, "_taste_retry_history", []) or []),
+                })
+                continue
+            attempt.update({
+                "authenticated": settings["authenticated"],
+                "attachment_field": field_name,
+                "content_length": len(content or b""),
+                "retry_history": retry_history,
+                "client_login_retry_history": settings.get("login_retry_history") or [],
+            })
+            if not content:
+                failures.append({"field_name": field_name, "reason": "empty_attachment"})
+                continue
+            if not content.startswith(b"%PDF"):
+                failures.append({"field_name": field_name, "reason": "attachment_not_pdf"})
+                continue
+            if failures:
+                attempt["attachment_fallbacks"] = failures
+            return content, attempt
+        failure_text = " ".join(clean(row.get("message")) for row in failures).lower()
+        reason = "authentication_failed" if any(token in failure_text for token in ("auth", "credential", "password", "401")) else "attachment_not_available"
+        return b"", {**attempt, "accepted": False, "reason": reason, "attachment_fallbacks": failures}
     except Exception as exc:
         message = str(exc)[:500]
         lower = message.lower()
@@ -118,7 +217,7 @@ def _validate_pdf_content(paper: dict[str, Any], content: bytes, target_dir: Pat
     return "", None, attempt
 
 
-def _candidate_urls(paper: dict[str, Any]) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+def _candidate_urls(paper: dict[str, Any], *, include_oa_lookups: bool = True) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
     candidates: list[dict[str, str]] = []
     receipts: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -129,6 +228,8 @@ def _candidate_urls(paper: dict[str, Any]) -> tuple[list[dict[str, str]], list[d
             seen.add(value)
             candidates.append({"url": value, "kind": kind})
 
+    for candidate in official_pdf_candidates(paper):
+        add(candidate["url"], candidate["kind"])
     add(paper.get("pdf_url"), "metadata_pdf")
     arxiv_id = _identifier(paper, "arxiv_id")
     if arxiv_id:
@@ -137,34 +238,124 @@ def _candidate_urls(paper: dict[str, Any]) -> tuple[list[dict[str, str]], list[d
     if openreview_id:
         add(f"https://openreview.net/pdf?id={openreview_id}", "openreview_pdf")
     doi = _identifier(paper, "doi")
-    if doi:
-        try:
-            response = get(f"https://api.openalex.org/works/https://doi.org/{quote(doi, safe='')}")
-            receipts.append({"kind": "openalex_lookup", **receipt(response)})
-            if response.ok:
-                payload = response.json()
-                best = payload.get("best_oa_location") if isinstance(payload.get("best_oa_location"), dict) else {}
-                primary = payload.get("primary_location") if isinstance(payload.get("primary_location"), dict) else {}
-                add(best.get("pdf_url"), "openalex_best_oa_pdf")
-                add(primary.get("pdf_url"), "openalex_primary_pdf")
-        except Exception as exc:
-            receipts.append({"kind": "openalex_lookup", "status": "error", "error_type": type(exc).__name__, "message": str(exc)[:500]})
-        email = clean(os.environ.get("UNPAYWALL_EMAIL") or os.environ.get("RECOMMEND_PAPERS_CONTACT_EMAIL"))
-        if email:
+    if doi and include_oa_lookups:
+        openalex_cooldown = cooldown_remaining("openalex")
+        if openalex_cooldown > 0:
+            receipts.append({"kind": "openalex_lookup", "status": "skipped_cooldown", "cooldown_remaining_seconds": round(openalex_cooldown, 3)})
+        else:
             try:
-                response = get(f"https://api.unpaywall.org/v2/{quote(doi, safe='')}", params={"email": email})
-                receipts.append({"kind": "unpaywall_lookup", **receipt(response)})
+                response = get(f"https://api.openalex.org/works/https://doi.org/{quote(doi, safe='')}")
+                receipts.append({"kind": "openalex_lookup", **receipt(response)})
                 if response.ok:
                     payload = response.json()
                     best = payload.get("best_oa_location") if isinstance(payload.get("best_oa_location"), dict) else {}
-                    add(best.get("url_for_pdf"), "unpaywall_pdf")
+                    primary = payload.get("primary_location") if isinstance(payload.get("primary_location"), dict) else {}
+                    add(best.get("pdf_url"), "openalex_best_oa_pdf")
+                    add(primary.get("pdf_url"), "openalex_primary_pdf")
             except Exception as exc:
-                receipts.append({"kind": "unpaywall_lookup", "status": "error", "error_type": type(exc).__name__, "message": str(exc)[:500]})
+                receipts.append({"kind": "openalex_lookup", "status": "error", "error_type": type(exc).__name__, "message": str(exc)[:500]})
+        email = clean(os.environ.get("UNPAYWALL_EMAIL") or os.environ.get("RECOMMEND_PAPERS_CONTACT_EMAIL"))
+        if email:
+            unpaywall_cooldown = cooldown_remaining("unpaywall")
+            if unpaywall_cooldown > 0:
+                receipts.append({"kind": "unpaywall_lookup", "status": "skipped_cooldown", "cooldown_remaining_seconds": round(unpaywall_cooldown, 3)})
+            else:
+                try:
+                    response = get(f"https://api.unpaywall.org/v2/{quote(doi, safe='')}", params={"email": email})
+                    receipts.append({"kind": "unpaywall_lookup", **receipt(response)})
+                    if response.ok:
+                        payload = response.json()
+                        best = payload.get("best_oa_location") if isinstance(payload.get("best_oa_location"), dict) else {}
+                        add(best.get("url_for_pdf"), "unpaywall_pdf")
+                except Exception as exc:
+                    receipts.append({"kind": "unpaywall_lookup", "status": "error", "error_type": type(exc).__name__, "message": str(exc)[:500]})
+    title = clean(paper.get("title"))
+    if include_oa_lookups and title:
+        # Current-year conference papers often expose accepted metadata before
+        # proceedings PDFs.  Exact-title OA lookup is therefore required even
+        # when no DOI has been assigned yet.  Never accept a fuzzy title match.
+        semantic_cooldown = cooldown_remaining("semantic_scholar")
+        if semantic_cooldown > 0:
+            receipts.append({"kind": "semantic_scholar_title_lookup", "status": "skipped_cooldown", "cooldown_remaining_seconds": round(semantic_cooldown, 3)})
+        else:
+            try:
+                response = get(
+                    "https://api.semanticscholar.org/graph/v1/paper/search",
+                    params={"query": title, "limit": 5, "fields": "title,openAccessPdf,externalIds"},
+                    timeout=45,
+                )
+                receipts.append({"kind": "semantic_scholar_title_lookup", **receipt(response)})
+                if response.ok:
+                    for item in response.json().get("data") or []:
+                        if _title_key(item.get("title")) != _title_key(title):
+                            continue
+                        oa = item.get("openAccessPdf") if isinstance(item.get("openAccessPdf"), dict) else {}
+                        add(oa.get("url"), "semantic_scholar_exact_title_pdf")
+                        external = item.get("externalIds") if isinstance(item.get("externalIds"), dict) else {}
+                        if clean(external.get("ArXiv")):
+                            add(f"https://arxiv.org/pdf/{clean(external.get('ArXiv'))}", "semantic_scholar_arxiv_pdf")
+                        break
+            except Exception as exc:
+                receipts.append({"kind": "semantic_scholar_title_lookup", "status": "error", "error_type": type(exc).__name__, "message": str(exc)[:500]})
+
+        hal_cooldown = cooldown_remaining("hal")
+        if hal_cooldown > 0:
+            receipts.append({"kind": "hal_title_lookup", "status": "skipped_cooldown", "cooldown_remaining_seconds": round(hal_cooldown, 3)})
+        else:
+            try:
+                response = get(
+                    "https://api.archives-ouvertes.fr/search/",
+                    params={"q": f'title_t:"{title}"', "fl": "title_s,fileMain_s", "rows": 5, "wt": "json"},
+                    timeout=45,
+                )
+                receipts.append({"kind": "hal_title_lookup", **receipt(response)})
+                if response.ok:
+                    for item in ((response.json().get("response") or {}).get("docs") or []):
+                        candidate_title = item.get("title_s")
+                        if isinstance(candidate_title, list):
+                            candidate_title = candidate_title[0] if candidate_title else ""
+                        if _title_key(candidate_title) != _title_key(title):
+                            continue
+                        file_url = item.get("fileMain_s")
+                        if isinstance(file_url, list):
+                            file_url = file_url[0] if file_url else ""
+                        add(file_url, "hal_exact_title_pdf")
+                        break
+            except Exception as exc:
+                receipts.append({"kind": "hal_title_lookup", "status": "error", "error_type": type(exc).__name__, "message": str(exc)[:500]})
+
+        arxiv_cooldown = cooldown_remaining("arxiv")
+        if arxiv_cooldown > 0:
+            receipts.append({"kind": "arxiv_title_lookup", "status": "skipped_cooldown", "cooldown_remaining_seconds": round(arxiv_cooldown, 3)})
+        else:
+            try:
+                response = get(
+                    "https://export.arxiv.org/api/query",
+                    params={"search_query": f'ti:"{title}"', "start": 0, "max_results": 5},
+                    timeout=90,
+                )
+                receipts.append({"kind": "arxiv_title_lookup", **receipt(response)})
+                if response.ok:
+                    namespace = {"a": "http://www.w3.org/2005/Atom"}
+                    root = ET.fromstring(response.content)
+                    for entry in root.findall("a:entry", namespace):
+                        candidate_title = clean(entry.findtext("a:title", default="", namespaces=namespace))
+                        if _title_key(candidate_title) != _title_key(title):
+                            continue
+                        arxiv_url = clean(entry.findtext("a:id", default="", namespaces=namespace))
+                        if arxiv_url:
+                            add(arxiv_url.replace("/abs/", "/pdf/"), "arxiv_exact_title_pdf")
+                        break
+            except Exception as exc:
+                receipts.append({"kind": "arxiv_title_lookup", "status": "error", "error_type": type(exc).__name__, "message": str(exc)[:500]})
     return candidates, receipts
 
 
 def _download_pdf(paper: dict[str, Any], target_dir: Path) -> tuple[str, Path | None, list[dict[str, Any]]]:
-    candidates, attempts = _candidate_urls(paper)
+    # Derive and try supplied/official locators before making any optional OA
+    # index request.  A slow or rate-limited discovery service must not delay a
+    # PDF that is already available from the conference.
+    candidates, attempts = _candidate_urls(paper, include_oa_lookups=False)
     if _identifier(paper, "openreview_id"):
         content, attempt = _authenticated_openreview_pdf(paper)
         if content:
@@ -174,27 +365,44 @@ def _download_pdf(paper: dict[str, Any], target_dir: Path) -> tuple[str, Path | 
                 return text, pdf_path, attempts
         else:
             attempts.append(attempt)
-    for candidate in candidates:
-        url = candidate["url"]
-        attempt: dict[str, Any] = {"kind": candidate["kind"], "url": url}
-        try:
-            response = get(url, timeout=45)
-            attempt.update(receipt(response))
-            content = response.content
-            if not response.ok:
-                attempt["accepted"] = False
-                if response.status_code == 403 and "openreview.net" in url:
-                    attempt["reason"] = "challenge_403"
-            elif not content.startswith(b"%PDF"):
-                attempt.update({"accepted": False, "reason": "not_pdf"})
-            else:
-                text, pdf_path, attempt = _validate_pdf_content(paper, content, target_dir, attempt)
-                if text:
-                    attempts.append(attempt)
-                    return text, pdf_path, attempts
-        except Exception as exc:
-            attempt.update({"accepted": False, "error_type": type(exc).__name__, "message": str(exc)[:500]})
-        attempts.append(attempt)
+    attempted_urls: set[str] = set()
+
+    def try_candidates(items: list[dict[str, str]]) -> tuple[str, Path | None]:
+        for candidate in items:
+            url = candidate["url"]
+            if url in attempted_urls:
+                continue
+            attempted_urls.add(url)
+            attempt: dict[str, Any] = {"kind": candidate["kind"], "url": url}
+            try:
+                response = get(url, timeout=45)
+                attempt.update(receipt(response))
+                content = response.content
+                if not response.ok:
+                    attempt["accepted"] = False
+                    if response.status_code == 403 and "openreview.net" in url:
+                        attempt["reason"] = "challenge_403"
+                elif not content.startswith(b"%PDF"):
+                    attempt.update({"accepted": False, "reason": "not_pdf"})
+                else:
+                    text, pdf_path, attempt = _validate_pdf_content(paper, content, target_dir, attempt)
+                    if text:
+                        attempts.append(attempt)
+                        return text, pdf_path
+            except Exception as exc:
+                attempt.update({"accepted": False, "error_type": type(exc).__name__, "message": str(exc)[:500]})
+            attempts.append(attempt)
+        return "", None
+
+    text, pdf_path = try_candidates(candidates)
+    if text:
+        return text, pdf_path, attempts
+
+    fallback_candidates, lookup_receipts = _candidate_urls(paper, include_oa_lookups=True)
+    attempts.extend(lookup_receipts)
+    text, pdf_path = try_candidates(fallback_candidates)
+    if text:
+        return text, pdf_path, attempts
     return "", None, attempts
 
 
@@ -216,6 +424,9 @@ def _pmc_xml(paper: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     doi = _identifier(paper, "doi")
     if not doi:
         return "", []
+    remaining = cooldown_remaining("europepmc")
+    if remaining > 0:
+        return "", [{"kind": "europepmc", "status": "skipped_cooldown", "cooldown_remaining_seconds": round(remaining, 3)}]
     attempts = []
     try:
         response = get("https://www.ebi.ac.uk/europepmc/webservices/rest/search", params={"query": f'DOI:"{doi}"', "format": "json", "pageSize": 5})
@@ -275,12 +486,18 @@ def acquire(paper: dict[str, Any], work_dir: Path) -> dict[str, Any]:
     if full_text_available:
         text_path = extracted / ("full_text.txt" if text_kind == "pdf" else f"full_text_{text_kind}.txt")
         write_text(text_path, text.rstrip() + "\n")
+    transient = _transient_acquisition(pdf_attempts, html_attempts, xml_attempts)
     return {
-        "schema_version": 1,
+        "schema_version": ACQUISITION_SCHEMA_VERSION,
         "identity": paper_identity(paper),
         "paper": paper,
-        "status": "ready" if full_text_available else "unavailable",
+        "status": "ready" if full_text_available else "temporarily_unavailable" if transient["retryable_after_cooldown"] else "unavailable",
         "full_text_available": full_text_available,
+        **({
+            "retryable_after_cooldown": True,
+            "cooldown_services": transient["cooldown_services"],
+            "temporary_failure_reasons": transient["reasons"],
+        } if not full_text_available and transient["retryable_after_cooldown"] else {}),
         "text_kind": text_kind if full_text_available else "",
         "text_chars": len(text) if full_text_available else 0,
         "text_path": str(text_path) if text_path else "",
@@ -290,8 +507,59 @@ def acquire(paper: dict[str, Any], work_dir: Path) -> dict[str, Any]:
     }
 
 
+def _transient_acquisition(*groups: list[dict[str, Any]]) -> dict[str, Any]:
+    """Classify throttling/challenge failures without calling a paper absent."""
+    services: set[str] = set()
+    reasons: set[str] = set()
+
+    def inspect(item: Any, inherited_openreview: bool = False) -> None:
+        if isinstance(item, list):
+            for child in item:
+                inspect(child, inherited_openreview)
+            return
+        if not isinstance(item, dict):
+            return
+        url = clean(item.get("url"))
+        kind = clean(item.get("kind")).lower()
+        reason = clean(item.get("reason") or item.get("status")).lower()
+        status_code = int(item.get("status_code") or 0)
+        is_openreview = inherited_openreview or "openreview" in kind or "openreview.net" in url
+        detected_service = ""
+        for known in ("openreview", "arxiv", "biorxiv", "openalex", "semantic_scholar", "hal", "europepmc", "unpaywall", "acm"):
+            if known in kind:
+                detected_service = known
+                break
+        if is_openreview:
+            detected_service = "openreview"
+        elif url:
+            detected_service = service_for(url)
+        retry_rows = item.get("retry_history") if isinstance(item.get("retry_history"), list) else []
+        retry_codes = {int(row.get("status_code") or 0) for row in retry_rows if isinstance(row, dict)}
+        if status_code == 429 or 429 in retry_codes or "rate" in reason and "limit" in reason:
+            services.add(detected_service)
+            reasons.add("http_429_rate_limited")
+        if status_code == 403 or reason in {"challenge_403", "http_403"} or "challenge" in reason:
+            services.add(detected_service)
+            reasons.add("openreview_403_challenge" if is_openreview else "http_403_access_challenge")
+        if reason in {"skipped_cooldown", "service_cooldown_active", "openreview_service_cooldown_active"}:
+            services.add(detected_service)
+            reasons.add("service_cooldown_active")
+        for value in item.values():
+            if isinstance(value, (dict, list)):
+                inspect(value, is_openreview)
+
+    for group in groups:
+        inspect(group)
+    services.discard("")
+    return {
+        "retryable_after_cooldown": bool(reasons),
+        "cooldown_services": sorted(services),
+        "reasons": sorted(reasons),
+    }
+
+
 def cache_key(paper: dict[str, Any]) -> str:
-    return stable_hash({"schema": 1, "identity": paper_identity(paper)})
+    return stable_hash({"schema": ACQUISITION_SCHEMA_VERSION, "identity": paper_identity(paper)})
 
 
 def _cache_aliases(paper: dict[str, Any]) -> list[str]:
@@ -322,7 +590,7 @@ def _alias_path(alias: str) -> Path:
 def _cached_from_directory(paper: dict[str, Any], directory: Path) -> dict[str, Any] | None:
     manifest = directory / "acquisition.json"
     payload = read_json(manifest, {})
-    if not isinstance(payload, dict) or payload.get("full_text_available") is not True:
+    if not isinstance(payload, dict) or payload.get("schema_version") != ACQUISITION_SCHEMA_VERSION or payload.get("full_text_available") is not True:
         return None
     cached_paper = payload.get("paper") if isinstance(payload.get("paper"), dict) else {}
     wanted_aliases = set(_cache_aliases(paper))
@@ -408,7 +676,7 @@ def acquire_many(papers: list[dict[str, Any]], run_dir: Path, workers: int) -> d
         paper_dir = input_dir / f"{index:04d}"
         receipt_path = paper_dir / "acquisition.json"
         prior = read_json(receipt_path, {})
-        if isinstance(prior, dict) and prior.get("identity") == identity and prior.get("full_text_available") is True:
+        if isinstance(prior, dict) and prior.get("schema_version") == ACQUISITION_SCHEMA_VERSION and prior.get("identity") == identity and prior.get("full_text_available") is True:
             prior["index"] = index
             prior["cache_status"] = "run_resume"
             return prior
@@ -423,7 +691,7 @@ def acquire_many(papers: list[dict[str, Any]], run_dir: Path, workers: int) -> d
             result = publish_cache(paper, paper_dir, result)
         except Exception as exc:
             result = {
-                "schema_version": 1,
+                "schema_version": ACQUISITION_SCHEMA_VERSION,
                 "identity": identity,
                 "paper": paper,
                 "status": "error",
@@ -446,15 +714,51 @@ def acquire_many(papers: list[dict[str, Any]], run_dir: Path, workers: int) -> d
             ready = sum(item.get("full_text_available") is True for item in results)
             update_run(run_dir, stage="fulltext_acquisition", counts={"requested": len(papers), "completed": len(results), "ready": ready})
     results.sort(key=lambda item: int(item["index"]))
+
+    # Match TASTE Reading's cooldown-expiry recovery: throttled/challenged
+    # papers are not permanent gaps.  Wait once for the shared service cooldown
+    # and retry them serially so the recovery itself cannot cause another burst.
+    retryable = [item for item in results if item.get("full_text_available") is not True and item.get("retryable_after_cooldown") is True]
+    recovery = {"eligible_count": len(retryable), "attempted_count": 0, "recovered_count": 0, "worker_count": 1, "waited_seconds": 0.0}
+    if retryable:
+        services = sorted({service for item in retryable for service in item.get("cooldown_services") or []})
+        remaining = max((cooldown_remaining(service) for service in services), default=0.0)
+        try:
+            wait_cap = max(0.0, float(os.environ.get("RECOMMEND_PAPERS_COOLDOWN_REQUEUE_WAIT_CAP_SECONDS", "180") or 180))
+        except (TypeError, ValueError):
+            wait_cap = 180.0
+        recovery.update({"services": services, "cooldown_remaining_seconds": round(remaining, 3), "wait_cap_seconds": wait_cap})
+        if remaining <= wait_cap:
+            if remaining > 0:
+                time.sleep(remaining)
+                recovery["waited_seconds"] = round(remaining, 3)
+            by_index = {int(item["index"]): item for item in results}
+            for initial in retryable:
+                index = int(initial["index"])
+                retried = one((index, papers[index - 1]))
+                recovery["attempted_count"] += 1
+                retried["cooldown_requeue"] = {
+                    "attempted": True,
+                    "initial_status": initial.get("status"),
+                    "initial_reasons": initial.get("temporary_failure_reasons") or [],
+                }
+                if retried.get("full_text_available") is True:
+                    recovery["recovered_count"] += 1
+                by_index[index] = retried
+            results = [by_index[index] for index in sorted(by_index)]
+        else:
+            recovery["skipped_reason"] = "cooldown_exceeds_wait_cap"
     ready = sum(item.get("full_text_available") is True for item in results)
     payload = {
-        "schema_version": 1,
+        "schema_version": ACQUISITION_SCHEMA_VERSION,
         "run_id": run_dir.name,
         "run_dir": str(run_dir),
         "status": "complete" if ready == len(results) else "complete_with_gaps",
         "requested_count": len(results),
         "full_text_ready_count": ready,
         "worker_count": worker_count,
+        "channel_concurrency_policy": "independent_service_slots",
+        "cooldown_requeue": recovery,
         "items": results,
         "completed_at": now_iso(),
     }
