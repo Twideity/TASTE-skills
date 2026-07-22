@@ -64,6 +64,74 @@ def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _source_label(item: dict[str, Any], paper: dict[str, Any]) -> str:
+    source = clean(paper.get("venue") or paper.get("source") or item.get("source")) or "来源未提供"
+    published = clean(paper.get("published") or paper.get("year") or item.get("published"))
+    conference_key = re.sub(r"[^a-z0-9]+", "", source.lower())
+    conference_keys = {"neurips", "nips", "iclr", "icml", "sigkdd", "kdd", "sigir", "cikm", "aaai", "iccv", "www", "cvpr", "acl", "ijcai", "eccv", "emnlp"}
+    year_match = re.search(r"\b(?:19|20)\d{2}\b", published)
+    source_date = year_match.group(0) if conference_key in conference_keys and year_match else published
+    return f"{source} {source_date}".strip()
+
+
+def _normalize_read_metadata(text: str, item: dict[str, Any]) -> str:
+    """Normalize only deterministic front matter; never rewrite scientific prose."""
+    paper = item.get("paper") if isinstance(item.get("paper"), dict) else {}
+    title = clean(paper.get("title") or item.get("title"))
+    normalized = text
+    if title:
+        normalized = re.sub(r"(?m)^#\s+.*$", f"# {title}", normalized, count=1)
+    normalized = re.sub(
+        r"(?m)^- \*\*来源：\*\*.*$",
+        f"- **来源：** {_source_label(item, paper)}",
+        normalized,
+        count=1,
+    )
+    normalized = re.sub(
+        r"(?m)^- \*\*论文链接：\*\*.*$",
+        f"- **论文链接：** URL：{_markdown_link('论文页面', paper.get('url') or item.get('paper_url'))}；PDF：{_markdown_link('PDF', _accepted_pdf_url(item, paper) or item.get('pdf_url'))}",
+        normalized,
+        count=1,
+    )
+    return normalized
+
+
+def _normalize_read_artifacts(
+    read_path: Path,
+    receipt_path: Path,
+    item: dict[str, Any],
+    *,
+    relocated: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    """Apply the upstream metadata repair and keep the machine receipt truthful."""
+    text = read_path.read_text(encoding="utf-8", errors="replace")
+    old_heading_match = re.search(r"(?m)^#\s+(.+?)\s*$", text)
+    old_heading = clean(old_heading_match.group(1)) if old_heading_match else ""
+    normalized = _normalize_read_metadata(text, item)
+    if normalized != text:
+        write_text(read_path, normalized)
+    receipt = read_json(receipt_path, {})
+    if not isinstance(receipt, dict):
+        receipt = {}
+    paper = item.get("paper") if isinstance(item.get("paper"), dict) else {}
+    audit = receipt.get("deep_read_audit") if isinstance(receipt.get("deep_read_audit"), dict) else {}
+    current_title = clean(paper.get("title") or item.get("title"))
+    receipt_title = clean(receipt.get("title"))
+    if receipt_title and _normalized_title(receipt_title) == _normalized_title(old_heading):
+        receipt["title"] = current_title
+    if clean(receipt.get("source")):
+        receipt["source"] = clean(paper.get("venue") or paper.get("source") or item.get("source"))
+    if relocated:
+        receipt["article_markdown_path"] = str(read_path)
+        audit["article_markdown_path"] = str(read_path)
+    if normalized != text:
+        audit["deterministic_metadata_normalization"] = True
+        audit["read_sha256"] = _sha256_text(normalized)
+    receipt["deep_read_audit"] = audit
+    write_json(receipt_path, receipt)
+    return normalized, receipt
+
+
 def _paper_dir(run_dir: Path, item: dict[str, Any]) -> Path:
     return run_dir / "papers" / f"{int(item.get('index') or 0):04d}"
 
@@ -80,12 +148,7 @@ def _markdown_link(label: str, url: Any) -> str:
 
 def _deep_read_prompt(item: dict[str, Any]) -> str:
     source = clean(item.get("source")) or "来源未提供"
-    published = clean(item.get("published"))
-    conference_key = re.sub(r"[^a-z0-9]+", "", source.lower())
-    conference_keys = {"neurips", "nips", "iclr", "icml", "sigkdd", "kdd", "sigir", "cikm", "aaai", "iccv", "www", "cvpr", "acl", "ijcai", "eccv", "emnlp"}
-    year_match = re.search(r"\b(?:19|20)\d{2}\b", published)
-    source_date = year_match.group(0) if conference_key in conference_keys and year_match else published
-    source_label = f"{source} {source_date}".strip()
+    source_label = _source_label(item, {})
     abstract_rule = (
         "把 source_abstract 的每个英文句子完整翻译成中文，不得概括、漏掉数字/结论/限制；专名和缩写可保留英文。"
         if clean(item.get("source_abstract")) else
@@ -150,6 +213,7 @@ def prepare_reads(run_dir: Path) -> dict[str, Any]:
             write_text(target, cached_md.read_text(encoding="utf-8"))
             receipt_target = paper_dir / "read_receipt.json"
             write_json(receipt_target, read_json(cached_receipt, {}))
+            _normalize_read_artifacts(target, receipt_target, item, relocated=True)
             restored.append({"identity": item.get("identity"), "read_path": str(target), "receipt_path": str(receipt_target), "cache": "hit"})
         else:
             paper = item.get("paper") if isinstance(item.get("paper"), dict) else {}
@@ -446,12 +510,11 @@ def validate_reads(run_dir: Path) -> dict[str, Any]:
         if not read_path.is_file():
             failures.append({"identity": item.get("identity"), "read_path": str(read_path), "errors": ["read.md is missing"]})
             continue
-        text = read_path.read_text(encoding="utf-8")
+        receipt_path = _paper_dir(directory, item) / "read_receipt.json"
+        text, receipt = _normalize_read_artifacts(read_path, receipt_path, item)
         errors = validate_read(text, title, paper)
         full_text_path = Path(clean(item.get("text_path"))).expanduser()
         full_text = full_text_path.read_text(encoding="utf-8") if full_text_path.is_file() else ""
-        receipt_path = _paper_dir(directory, item) / "read_receipt.json"
-        receipt = read_json(receipt_path, None)
         errors.extend(_validate_receipt(receipt, item, read_path, full_text))
         if errors:
             failures.append({"identity": item.get("identity"), "read_path": str(read_path), "errors": errors})

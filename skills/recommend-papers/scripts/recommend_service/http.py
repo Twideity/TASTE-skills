@@ -40,7 +40,9 @@ DEFAULT_CONCURRENCY = {
     # shared service gate.  Keep that safe default while still allowing an
     # operator to raise the channel to OpenReview's observed ceiling of three.
     "openreview": 1,
-    "dblp": 4,
+    # Latest TASTE serializes DBLP starts.  The public service is particularly
+    # prone to 429s during complete multi-volume venue crawls.
+    "dblp": 1,
     "crossref": 4,
     "openalex": 4,
     "europepmc": 4,
@@ -70,7 +72,7 @@ def service_for(url: str) -> str:
         return "biorxiv"
     if "openreview.net" in host:
         return "openreview"
-    if "dblp.org" in host:
+    if host in {"dblp.org", "www.dblp.org", "dblp.uni-trier.de", "dblp.dagstuhl.de"}:
         return "dblp"
     if "crossref.org" in host:
         return "crossref"
@@ -108,6 +110,32 @@ def _state_lock_path(service: str) -> Path:
 
 def _slot_path(service: str, index: int) -> Path:
     return HTTP_STATE_ROOT / f".{_lock_key(service)}.slot-{index:02d}.lock"
+
+
+class ServiceRequestDeferred(RuntimeError):
+    """A channel is cooling down longer than an interactive run should wait."""
+
+
+_DBLP_HOSTS = ("dblp.org", "dblp.uni-trier.de", "dblp.dagstuhl.de")
+
+
+def _dblp_url_candidates(url: str) -> list[str]:
+    """Return equivalent official DBLP mirrors, preserving path/query exactly."""
+    parsed = urlparse(str(url or "").strip())
+    host = (parsed.hostname or "").lower()
+    if host == "www.dblp.org":
+        host = "dblp.org"
+    if host not in _DBLP_HOSTS:
+        return [url]
+    hosts = [host, *[candidate for candidate in _DBLP_HOSTS if candidate != host]]
+    return [parsed._replace(scheme="https", netloc=candidate).geturl() for candidate in hosts]
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
 
 
 def concurrency_limit(service: str) -> int:
@@ -188,7 +216,12 @@ def request_slot(service: str) -> Iterator[None]:
                 now = time.time()
                 cooldown_until = float(state.get("cooldown_until") or 0)
                 if cooldown_until > now:
-                    time.sleep(cooldown_until - now)
+                    remaining = cooldown_until - now
+                    if service == "dblp" and remaining > _positive_float_env("DBLP_MAX_RETRY_AFTER_WAIT_SEC", 10.0):
+                        raise ServiceRequestDeferred(
+                            f"DBLP request deferred for Retry-After cooldown ({remaining:.0f}s remaining)"
+                        )
+                    time.sleep(remaining)
                 now = time.time()
                 last_request = float(state.get("last_request_at") or 0)
                 wait = max(0.0, MIN_INTERVALS.get(service, MIN_INTERVALS["generic"]) - (now - last_request))
@@ -307,12 +340,18 @@ def get(url: str, *, params: dict | None = None, headers: dict | None = None, ti
     retry_history = []
     retryable_statuses = {429, 500, 502, 503, 504}
     max_attempts = 8 if service == "arxiv" else 5
+    candidates = _dblp_url_candidates(url) if service == "dblp" else [url]
+    candidate_index = 0
     for attempt in range(1, max_attempts + 1):
+        candidate_url = candidates[min(candidate_index, len(candidates) - 1)]
         try:
             with request_slot(service):
-                response = requests.get(url, params=params, headers=merged, timeout=timeout, stream=stream)
+                response = requests.get(candidate_url, params=params, headers=merged, timeout=timeout, stream=stream)
                 if response.status_code in retryable_statuses:
-                    fallback = min(300.0, 30.0 * (2 ** (attempt - 1)))
+                    # DBLP's latest upstream adapter switches official mirrors
+                    # immediately for transient server failures and uses its
+                    # one-second channel spacing when 429 omits Retry-After.
+                    fallback = (1.0 if response.status_code == 429 else 0.0) if service == "dblp" else min(300.0, 30.0 * (2 ** (attempt - 1)))
                     retry_after = _retry_after(response, fallback)
                     retry_history.append({"attempt": attempt, "status_code": response.status_code, "retry_after_seconds": retry_after})
                     _record_response(service, response.status_code, retry_after, attempt)
@@ -322,11 +361,15 @@ def get(url: str, *, params: dict | None = None, headers: dict | None = None, ti
                     _record_response(service, response.status_code)
         except requests.RequestException as exc:
             retry_history.append({"attempt": attempt, "error_type": type(exc).__name__, "message": str(exc)[:300]})
+            if service == "dblp":
+                candidate_index = min(candidate_index + 1, len(candidates) - 1)
             if attempt >= max_attempts:
                 raise
             time.sleep(min(8.0, float(2 ** (attempt - 1))))
             continue
         if response.status_code in retryable_statuses and attempt < max_attempts:
+            if service == "dblp" and response.status_code != 429:
+                candidate_index = min(candidate_index + 1, len(candidates) - 1)
             continue
         setattr(response, "_taste_retry_history", retry_history)
         return response

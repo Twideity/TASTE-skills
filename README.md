@@ -53,21 +53,7 @@ The user does not need to specify every setting. For a comprehensive review, omi
 
 ### 4. Enable Claude deep reading (optional)
 
-Claude is optional. When an authenticated `claude` CLI is available, the skill uses the first deep-reading method by default: one fresh external Claude process per paper, with a continuously refilled maximum of 16 simultaneous processes and one validated Chinese reading artifact per paper.
-
-Install/configure Claude CLI separately, then use either its normal login or an API key supported by your Claude CLI installation. The backend recognizes `ANTHROPIC_API_KEY` or a successful `claude auth status --json` result. For large reading jobs, API charges can grow quickly because every paper is a separate Claude call. Prefer a lower-cost API plan/model with a clear spending limit, and test a small paper count before reading 100 papers.
-
-Optional cost controls:
-
-```bash
-export ANTHROPIC_API_KEY='your-api-key'
-export CLAUDE_MODEL='your-provider-supported-lower-cost-model'
-export CLAUDE_MAX_BUDGET_USD='your-per-paper-limit'
-```
-
-`CLAUDE_MODEL` is passed to `claude --model`. `CLAUDE_MAX_BUDGET_USD` is passed to `claude --max-budget-usd` for each paper process, so it is a per-paper ceiling rather than a whole-run ceiling. Never commit API keys to this repository.
-
-Verify availability with the `doctor` command in step 5. Its `claude.available` field must be `true` before the default method is dispatched.
+Claude is optional. After installing and signing in to Claude CLI, the skill uses the first method by default: one fresh external Claude per paper, with at most 16 running simultaneously. For large reading jobs, prefer an inexpensive API because every paper requires a separate Claude call. Step 5 can verify whether Claude is available.
 
 If you do not want to configure or pay for Claude, say:
 
@@ -131,7 +117,7 @@ Defaults are fallbacks rather than minimums. Each turn may independently customi
 - Built-in conference coverage also includes SIGKDD/KDD, SIGIR, CIKM, AAAI, ICCV, WWW, CVPR, ACL, IJCAI, ECCV, and EMNLP. Conference metadata uses the corresponding official live channel and is accepted only when the complete title-and-abstract corpus is verified. The current/requested year is actually probed across proceedings, accepted-paper pages, OpenReview, virtual sites, OJS, and indexes before any older-year fallback; a future release date alone never suppresses crawling.
 - arXiv: the trailing six calendar months, inclusive, across `cs.AI`, `cs.LG`, `stat.ML`, `cs.CL`, `cs.CV`, `cs.IR`, `cs.RO`, `eess.SY`, `cs.MA`, and `cs.NE` unless the user explicitly supplies categories.
 - Topic-adaptive sources: one to three additional sources selected by Codex.
-- Full-text download workers: 8 globally. Different APIs and official hosts run concurrently; every channel has its own concurrency slots, request interval, and cooldown. Same-channel capacity is source-specific and can be overridden with `RECOMMEND_PAPERS_HTTP_CONCURRENCY`. OpenReview defaults to one shared slot and cannot exceed three; official-client login/API/attachment and direct PDF/HTML requests share this gate. Papers deferred by 429/403/challenge are labeled temporary, then retried once through a single recovery worker after the shared cooldown instead of being reported as having no PDF.
+- Full-text download workers: 8 globally. Different APIs and official hosts run concurrently; every channel has its own concurrency slots, request interval, and cooldown. Same-channel capacity is source-specific and can be overridden with `RECOMMEND_PAPERS_HTTP_CONCURRENCY`. DBLP defaults to one slot and rotates among its three official mirrors on network/5xx failures; a long `Retry-After` is deferred instead of freezing the run. OpenReview defaults to one shared slot and cannot exceed three; official-client login/API/attachment and direct PDF/HTML requests share this gate. Papers deferred by 429/403/challenge are labeled temporary, then retried once through a single recovery worker after the shared cooldown instead of being reported as having no PDF.
 - Reading defaults to one fresh external Claude CLI process per paper through a continuously refilled pool capped at 16 simultaneous processes. If Claude is unavailable or explicitly disabled, exactly three Codex subagents directly read three balanced paper batches without per-paper artifacts.
 
 Users may override the shortlist count, final recommendation count, explicit sources, categories, date range, and ranking priorities in the request.
@@ -222,7 +208,9 @@ skills/recommend-papers/
 ├── agents/openai.yaml
 ├── references/
 │   ├── defaults.json
+│   ├── live-source-validation-2026-07-22.md
 │   ├── migration-parity.md
+│   ├── research-modes.md
 │   ├── scoring-rubric.md
 │   └── service-contract.md
 └── scripts/
@@ -231,7 +219,7 @@ skills/recommend-papers/
 ```
 
 - `SKILL.md` controls Codex behavior and the mandatory workflow.
-- `references/` contains defaults, scoring rules, migration semantics, and the service contract.
+- `references/` contains defaults, live-source baselines, multi-turn modes, scoring rules, migration semantics, and the service contract. `SKILL.md` loads each one only for the stage that needs it.
 - `scripts/recommend_service/` is the deterministic crawler, cache, acquisition, validation, and state backend.
 - Codex coordinates the workflow; external Claude processes produce default per-paper analyses, while the no-Claude fallback uses exactly three direct Codex batch readers.
 
@@ -296,21 +284,7 @@ $recommend-papers 调研最近两年的多模态RAG论文，深读前50篇，最
 
 ### 4. 启用Claude精读（可选）
 
-Claude不是必需依赖。安装并认证`claude` CLI后，skill默认使用第一种精读方式：每篇论文启动一个全新的外部Claude进程，最多同时运行16个，并为每篇论文生成经过验证的中文精读产物。
-
-请单独安装和配置Claude CLI，可以使用正常登录，也可以使用当前Claude CLI支持的API密钥。后端会识别`ANTHROPIC_API_KEY`，或者以`claude auth status --json`的成功结果判断Claude可用。大量论文会产生大量独立Claude调用，阅读100篇时费用可能很明显。最好选择价格较低、额度和账单上限清晰的API套餐或模型，并先用少量论文试运行，再扩大到100篇。
-
-可以设置以下成本控制项：
-
-```bash
-export ANTHROPIC_API_KEY='你的API密钥'
-export CLAUDE_MODEL='你的API支持的低成本模型标识'
-export CLAUDE_MAX_BUDGET_USD='每篇论文允许的美元上限'
-```
-
-`CLAUDE_MODEL`会传给`claude --model`；`CLAUDE_MAX_BUDGET_USD`会传给每个论文进程的`claude --max-budget-usd`，因此它限制的是每篇论文，而不是整个任务的总费用。不要把API密钥提交到本仓库。
-
-使用第5步的`doctor`检查Claude状态；只有输出中的`claude.available`为`true`时，系统才会启动默认Claude精读。
+Claude不是必需依赖。安装并登录Claude CLI后，skill默认使用第一种精读方式：每篇论文启动一个全新的外部Claude，最多同时运行16个。大量精读时，每篇论文都会产生一次独立Claude调用，最好使用便宜的API。第5步可以检查Claude是否可用。
 
 如果不想配置或付费使用Claude，直接说：
 
@@ -374,7 +348,7 @@ PowerShell中使用`& $python $service cache-status`。
 - 内置会议还包括 SIGKDD/KDD、SIGIR、CIKM、AAAI、ICCV、WWW、CVPR、ACL、IJCAI、ECCV、EMNLP；分别使用对应官方实时渠道，只有完整标题与摘要全集通过验证后才会写入年度缓存。系统会先实际探测当年/指定年份的论文集、accepted-papers、OpenReview、virtual、OJS 和索引渠道，再考虑回退旧年份；未来发布日期本身绝不会阻止爬取。
 - arXiv 为最近六个日历月，默认分类包括 `cs.AI`、`cs.LG`、`stat.ML`、`cs.CL`、`cs.CV`、`cs.IR`、`cs.RO`、`eess.SY`、`cs.MA`、`cs.NE`。
 - Codex根据主题增加1–3个渠道。
-- 全文下载默认全局8个worker；不同API和官方主机可同时运行，各渠道独立限制并发、请求间隔和冷却。同渠道容量按来源配置，也可通过 `RECOMMEND_PAPERS_HTTP_CONCURRENCY` 覆盖。OpenReview默认只使用1个共享槽位，且无论如何不超过3；官方client登录/API/附件与PDF/HTML直链共用同一门控和冷却。因429、403或challenge延期的论文会标记为暂时失败，并在冷却后由1个恢复worker自动重试一次，不会被表述为“没有PDF”。
+- 全文下载默认全局8个worker；不同API和官方主机可同时运行，各渠道独立限制并发、请求间隔和冷却。同渠道容量按来源配置，也可通过 `RECOMMEND_PAPERS_HTTP_CONCURRENCY` 覆盖。DBLP默认1个槽位，网络错误或5xx时会在三个官方镜像间切换；过长的 `Retry-After` 会延期而不是卡住整次运行。OpenReview默认只使用1个共享槽位，且无论如何不超过3；官方client登录/API/附件与PDF/HTML直链共用同一门控和冷却。因429、403或challenge延期的论文会标记为暂时失败，并在冷却后由1个恢复worker自动重试一次，不会被表述为“没有PDF”。
 - 默认每篇全文使用一个全新的外部Claude CLI进程，但同时最多运行16个；任一进程完成后立即补入下一篇。Claude不可用或用户明确禁用时，恰好启动三个Codex subagent，直接阅读平均分配的三批论文，不生成逐篇产物。
 
 用户可在请求中覆盖初筛数量、最终推荐数量、渠道、分类、日期和排名侧重点。

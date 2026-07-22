@@ -86,16 +86,6 @@ def _run_one(claude: str, item: dict[str, Any], timeout_sec: int, repair_suffix:
         "--add-dir",
         str(paper_dir),
     ]
-    model = clean(os.environ.get("CLAUDE_MODEL"))
-    if model:
-        command.extend(["--model", model])
-    budget = clean(os.environ.get("CLAUDE_MAX_BUDGET_USD"))
-    if budget:
-        try:
-            if float(budget) > 0:
-                command.extend(["--max-budget-usd", budget])
-        except ValueError:
-            pass
     if full_text_path.parent != paper_dir:
         command.extend(["--add-dir", str(full_text_path.parent)])
     environment = os.environ.copy()
@@ -126,8 +116,6 @@ def _run_one(claude: str, item: dict[str, Any], timeout_sec: int, repair_suffix:
             "status": "complete" if success else "claude_unavailable" if unavailable else "failed",
             "return_code": process.returncode,
             "duration_seconds": round(time.time() - started, 3),
-            "model": model or "claude_cli_default",
-            "max_budget_usd": budget or "",
             "read_path": str(read_path),
             "receipt_path": str(receipt_path),
             "stdout_path": str(paper_dir / "claude_stdout.json"),
