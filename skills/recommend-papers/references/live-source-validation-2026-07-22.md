@@ -33,3 +33,10 @@ These results mean that ICLR, ICML, KDD, SIGIR, WWW, AAAI, CVPR, ACL, and IJCAI
 already exposed useful 2026 data on the validation date even though not every
 archival proceedings site was final.  They do not justify inventing records for
 channels that actually returned zero, 404, or stale prior-year content.
+
+Follow-up on 2026-07-23: an isolated run-aware KDD probe completed in roughly
+30 seconds. It discovered the same 256-title DBLP pool, selected exactly three
+rows, and performed enrichment only for those three. One sample obtained an
+abstract; two remained sample-partial after ACM 403 and Semantic Scholar 429
+events. The year was still correctly reported as available, while the receipt
+kept `complete_catalog: false` and required a later formal full crawl.

@@ -125,6 +125,7 @@ def main(argv: list[str] | None = None) -> int:
     probe.add_argument("--start-year", type=int, default=datetime.now().year)
     probe.add_argument("--lookback", type=int, default=5)
     probe.add_argument("--sample-limit", type=int, default=3)
+    probe.add_argument("--run-dir", type=Path)
     meta = sub.add_parser("metadata")
     meta.add_argument("--plan", type=Path, required=True)
     meta.add_argument("--run-dir", type=Path)
@@ -170,7 +171,13 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "catalog":
         result = catalog(args.query)
     elif args.command == "probe-venue":
-        result = probe_venue({"type": "venue", "venue_id": args.venue_id, "venue": args.venue, "adapter": args.adapter, "openreview_venue_id": args.openreview_venue_id}, args.start_year, args.lookback, args.sample_limit)
+        result = probe_venue(
+            {"type": "venue", "venue_id": args.venue_id, "venue": args.venue, "adapter": args.adapter, "openreview_venue_id": args.openreview_venue_id},
+            args.start_year,
+            args.lookback,
+            args.sample_limit,
+            args.run_dir,
+        )
     elif args.command == "metadata":
         result = run_metadata(args.plan.resolve(), args.run_dir)
     elif args.command == "shortlist":

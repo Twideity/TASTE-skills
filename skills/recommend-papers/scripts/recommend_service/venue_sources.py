@@ -11,7 +11,9 @@ the same indexed enrichment sources used by TASTE) before the corpus is accepted
 import hashlib
 import html
 import json
+import os
 import re
+import shutil
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -21,7 +23,8 @@ from urllib.parse import quote, urljoin
 from bs4 import BeautifulSoup
 import fitz
 
-from .http import cooldown_remaining, get, post, receipt
+from .http import bounded_request_policy, cooldown_remaining, get, post, receipt
+from .storage import DATA_ROOT, METADATA_CACHE_ROOT, read_json, write_json
 
 
 def clean(value: Any) -> str:
@@ -175,6 +178,10 @@ def _enrich_all(rows: list[dict[str, Any]], worker_count: int = 8) -> list[dict[
     pending = [row for row in rows if not clean(row.get("abstract"))]
     if not pending:
         return rows
+    if worker_count <= 1:
+        for row in pending:
+            _enrich_detail(row)
+        return rows
     with ThreadPoolExecutor(max_workers=max(1, min(worker_count, len(pending)))) as pool:
         futures = [pool.submit(_enrich_detail, row) for row in pending]
         for future in as_completed(futures):
@@ -193,6 +200,49 @@ def _result(rows: list[dict[str, Any]], *, adapter: str, requests: list[dict[str
         "status": "complete", "complete_catalog": True, "exhausted": True,
         "truncated": False, "exhaustion_proof": proof, "adapter": adapter,
         "count": len(rows), "requests": requests,
+    }
+
+
+def _probe_limit(spec: dict[str, Any]) -> int:
+    try:
+        return max(0, int(spec.get("_probe_limit") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _selected_rows(spec: dict[str, Any], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    limit = _probe_limit(spec)
+    return rows[:limit] if limit else rows
+
+
+def _finish_rows(
+    spec: dict[str, Any],
+    rows: list[dict[str, Any]],
+    *,
+    adapter: str,
+    requests: list[dict[str, Any]],
+    proof: str,
+    discovered_count: int | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    limit = _probe_limit(spec)
+    if not limit:
+        return _result(rows, adapter=adapter, requests=requests, proof=proof)
+    samples = rows[:limit]
+    missing = sum(not clean(row.get("abstract")) for row in samples)
+    return samples, {
+        "status": "sample_complete" if samples and not missing else ("sample_partial" if samples else "empty"),
+        "probe_only": True,
+        "complete_catalog": False,
+        "exhausted": False,
+        "truncated": bool(samples),
+        "exhaustion_proof": "probe_sample_only_not_a_complete_catalog",
+        "adapter": adapter,
+        "count": len(samples),
+        "sample_limit": limit,
+        "discovered_title_count": len(rows) if discovered_count is None else discovered_count,
+        "missing_sample_abstracts": missing,
+        "metadata_sample_complete": bool(samples) and missing == 0,
+        "requests": requests,
     }
 
 
@@ -224,8 +274,9 @@ def fetch_neurips_official(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             continue
         seen.add(detail_url)
         rows.append({"title": title, "abstract": "", "authors": [], "published": f"{year}-01-01", "year": year, "url": detail_url, "pdf_url": "", "venue": "NeurIPS", "categories": [], "identifiers": {}, "metadata": {"official_index": response.url}})
-    _enrich_all(rows)
-    return _result(rows, adapter="neurips_official_papers", requests=[receipt(response)], proof="official_neurips_proceedings_index_exhausted_and_all_details_enriched")
+    selected = _selected_rows(spec, rows)
+    _enrich_all(selected, worker_count=1 if _probe_limit(spec) else 8)
+    return _finish_rows(spec, selected, adapter="neurips_official_papers", requests=[receipt(response)], proof="official_neurips_proceedings_index_exhausted_and_all_details_enriched", discovered_count=len(rows))
 
 
 def fetch_icml_official(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -244,8 +295,9 @@ def fetch_icml_official(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dic
         seen.add(detail_url)
         presentation = next((label for marker, label in (("/oral/", "oral"), ("/spotlight/", "spotlight"), ("/poster/", "poster")) if marker in href), "paper")
         rows.append({"title": title, "abstract": "", "authors": [], "published": f"{year}-01-01", "year": year, "url": detail_url, "pdf_url": "", "venue": "ICML", "categories": [presentation], "presentation_type": presentation, "identifiers": {}, "metadata": {"official_index": list_url}})
-    _enrich_all(rows)
-    return _result(rows, adapter="icml_official_virtual", requests=[receipt(response)], proof="official_icml_virtual_index_exhausted_and_all_details_enriched")
+    selected = _selected_rows(spec, rows)
+    _enrich_all(selected, worker_count=1 if _probe_limit(spec) else 8)
+    return _finish_rows(spec, selected, adapter="icml_official_virtual", requests=[receipt(response)], proof="official_icml_virtual_index_exhausted_and_all_details_enriched", discovered_count=len(rows))
 
 
 def fetch_cvf(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -275,8 +327,9 @@ def fetch_cvf(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any
                     pdf_url = urljoin(list_url, str(anchor.get("href")))
                     break
         rows.append({"title": title, "abstract": "", "authors": authors, "published": f"{year}-01-01", "year": year, "url": detail_url, "pdf_url": pdf_url, "venue": venue, "categories": [], "identifiers": {}, "metadata": {"official_index": list_url}})
-    _enrich_all(rows)
-    return _result(rows, adapter="cvf_openaccess", requests=[receipt(response)], proof="official_cvf_index_exhausted_and_all_details_enriched")
+    selected = _selected_rows(spec, rows)
+    _enrich_all(selected, worker_count=1 if _probe_limit(spec) else 8)
+    return _finish_rows(spec, selected, adapter="cvf_openaccess", requests=[receipt(response)], proof="official_cvf_index_exhausted_and_all_details_enriched", discovered_count=len(rows))
 
 
 def fetch_acl_anthology(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -317,8 +370,9 @@ def fetch_acl_anthology(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dic
                 abstract_node = node.find("abstract")
                 abstract = clean("".join(abstract_node.itertext()) if abstract_node is not None else "")
                 rows.append({"title": title, "abstract": abstract, "authors": authors, "published": f"{year}-01-01", "year": year, "url": paper_url, "pdf_url": paper_url.rstrip("/") + ".pdf", "venue": venue, "categories": [], "identifiers": {"doi": clean(node.findtext("doi")), "acl_anthology_id": anthology_id}, "metadata": {"official_xml": source_url}})
-    _enrich_all(rows)
-    return _result(rows, adapter="acl_anthology", requests=requests, proof="official_acl_anthology_xml_exhausted_and_all_abstracts_present")
+    selected = _selected_rows(spec, rows)
+    _enrich_all(selected, worker_count=1 if _probe_limit(spec) else 8)
+    return _finish_rows(spec, selected, adapter="acl_anthology", requests=requests, proof="official_acl_anthology_xml_exhausted_and_all_abstracts_present", discovered_count=len(rows))
 
 
 def _parse_ijcai_accepted(html_text: str, *, year: int, page_url: str) -> list[dict[str, Any]]:
@@ -385,17 +439,20 @@ def fetch_ijcai(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, A
         detail_url = urljoin(list_url, str(detail.get("href"))) if detail else ""
         rows.append({"title": title, "abstract": "", "authors": [clean(authors_node.get_text(" ", strip=True))] if authors_node else [], "published": f"{year}-01-01", "year": year, "url": detail_url, "pdf_url": urljoin(list_url, str(pdf.get("href"))) if pdf else "", "venue": "IJCAI", "categories": [], "identifiers": {}, "metadata": {"official_index": list_url}})
     if rows:
-        _enrich_all(rows)
-        return _result(rows, adapter="ijcai_proceedings", requests=requests, proof="official_ijcai_index_exhausted_and_all_details_enriched")
+        selected = _selected_rows(spec, rows)
+        _enrich_all(selected, worker_count=1 if _probe_limit(spec) else 8)
+        return _finish_rows(spec, selected, adapter="ijcai_proceedings", requests=requests, proof="official_ijcai_index_exhausted_and_all_details_enriched", discovered_count=len(rows))
 
     accepted_url = f"https://{year}.ijcai.org/accepted-papers/"
     accepted_response = _response(accepted_url)
     requests.append(receipt(accepted_response))
     rows = _parse_ijcai_accepted(accepted_response.text, year=year, page_url=accepted_url)
+    discovered_count = len(rows)
+    rows = _selected_rows(spec, rows)
     for row in rows:
         if not clean(row.get("abstract")):
             _indexed_enrich(row)
-    return _result(rows, adapter="ijcai_accepted_papers", requests=requests, proof="official_ijcai_accepted_papers_page_exhausted")
+    return _finish_rows(spec, rows, adapter="ijcai_accepted_papers", requests=requests, proof="official_ijcai_accepted_papers_page_exhausted", discovered_count=discovered_count)
 
 
 def fetch_eccv(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -415,8 +472,9 @@ def fetch_eccv(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, An
             continue
         seen.add(url)
         rows.append({"title": title, "abstract": "", "authors": [], "published": f"{year}-01-01", "year": year, "url": url, "pdf_url": "", "venue": "ECCV", "categories": [], "identifiers": {}, "metadata": {"official_index": list_url}})
-    _enrich_all(rows)
-    return _result(rows, adapter="eccv_virtual", requests=[receipt(response)], proof="official_ecva_index_exhausted_and_all_details_enriched")
+    selected = _selected_rows(spec, rows)
+    _enrich_all(selected, worker_count=1 if _probe_limit(spec) else 8)
+    return _finish_rows(spec, selected, adapter="eccv_virtual", requests=[receipt(response)], proof="official_ecva_index_exhausted_and_all_details_enriched", discovered_count=len(rows))
 
 
 def _aaai_issue_links(year: int) -> tuple[list[tuple[str, str]], list[dict[str, Any]]]:
@@ -468,8 +526,9 @@ def fetch_aaai(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, An
             seen.add(title_key(title))
             authors_node = article.select_one(".authors")
             rows.append({"title": title, "abstract": "", "authors": [clean(authors_node.get_text(" ", strip=True))] if authors_node else [], "published": f"{year}-01-01", "year": year, "url": url, "pdf_url": "", "venue": "AAAI", "categories": [], "identifiers": {}, "metadata": {"aaai_issue": issue_label, "official_issue_url": issue_url}})
-    _enrich_all(rows)
-    return _result(rows, adapter="aaai_ojs", requests=requests, proof="official_aaai_ojs_issues_exhausted_and_all_details_enriched")
+    selected = _selected_rows(spec, rows)
+    _enrich_all(selected, worker_count=1 if _probe_limit(spec) else 8)
+    return _finish_rows(spec, selected, adapter="aaai_ojs", requests=requests, proof="official_aaai_ojs_issues_exhausted_and_all_details_enriched", discovered_count=len(rows))
 
 
 def _openalex_abstract(index: Any) -> str:
@@ -507,7 +566,7 @@ def _try_acm_pdf_abstract(row: dict[str, Any]) -> bool:
     return False
 
 
-def _indexed_enrich(row: dict[str, Any]) -> dict[str, Any]:
+def _indexed_enrich_once(row: dict[str, Any], *, allow_remote_arxiv: bool = True) -> dict[str, Any]:
     identifiers = row.setdefault("identifiers", {})
     doi = clean(identifiers.get("doi"))
     attempts = row.setdefault("metadata", {}).setdefault("indexed_enrichment", [])
@@ -584,7 +643,7 @@ def _indexed_enrich(row: dict[str, Any]) -> dict[str, Any]:
                     break
         except Exception as exc:
             attempts.append({"source": "hal_title_for_acm", "error": str(exc)[:300]})
-    if not clean(row.get("abstract")) and cooldown_remaining("arxiv") <= 0:
+    if not clean(row.get("abstract")) and allow_remote_arxiv and cooldown_remaining("arxiv") <= 0:
         try:
             response = get("https://export.arxiv.org/api/query", params={"search_query": f'ti:\"{clean(row.get("title"))}\"', "start": 0, "max_results": 5}, timeout=90)
             attempts.append({"source": "arxiv_title_match_for_acm", **receipt(response)})
@@ -602,7 +661,95 @@ def _indexed_enrich(row: dict[str, Any]) -> dict[str, Any]:
                     break
         except Exception as exc:
             attempts.append({"source": "arxiv_title_match_for_acm", "error": str(exc)[:300]})
+    elif not clean(row.get("abstract")) and not allow_remote_arxiv:
+        attempts.append({"source": "arxiv_title_match_for_acm", "status": "skipped_run_request_budget"})
     return row
+
+
+def _indexed_enrich(row: dict[str, Any], *, allow_remote_arxiv: bool = True) -> dict[str, Any]:
+    # These are optional per-paper fallbacks, not the authoritative base crawl.
+    # One throttled index must not hold a complete venue run for 22.5 minutes.
+    with bounded_request_policy(max_attempts=2, max_wait_seconds=15.0):
+        return _indexed_enrich_once(row, allow_remote_arxiv=allow_remote_arxiv)
+
+
+def _batch_local_arxiv_enrich(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reuse exact-title arXiv cache matches before making remote title calls."""
+    wanted = {title_key(row.get("title")): row for row in rows if not clean(row.get("abstract"))}
+    wanted.pop("", None)
+    if not wanted:
+        return rows
+    arxiv_root = METADATA_CACHE_ROOT / "arxiv"
+    if not arxiv_root.is_dir():
+        return rows
+    for path in arxiv_root.glob("*/*.json"):
+        payload = read_json(path, {})
+        papers = payload.get("papers") if isinstance(payload, dict) else []
+        for paper in papers or []:
+            if not isinstance(paper, dict):
+                continue
+            key = title_key(paper.get("title"))
+            row = wanted.get(key)
+            abstract = clean(paper.get("abstract"))
+            if row is None or not abstract:
+                continue
+            row["abstract"] = abstract
+            row["pdf_url"] = clean(row.get("pdf_url")) or clean(paper.get("pdf_url"))
+            row.setdefault("metadata", {}).setdefault("indexed_enrichment", []).append({
+                "source": "local_arxiv_exact_title_cache",
+                "cache_path": str(path),
+            })
+            wanted.pop(key, None)
+        if not wanted:
+            break
+    return rows
+
+
+def _acm_stage_dir(venue_id: str, year: int):
+    return DATA_ROOT / "state" / "venue-staging" / "acm" / venue_id / str(year)
+
+
+def _acm_checkpoint_path(venue_id: str, year: int, row: dict[str, Any]):
+    return _acm_stage_dir(venue_id, year) / f"{stable_id('paper', title_key(row.get('title'))).split(':', 1)[1]}.json"
+
+
+def _restore_acm_checkpoints(venue_id: str, year: int, rows: list[dict[str, Any]]) -> int:
+    restored = 0
+    for row in rows:
+        payload = read_json(_acm_checkpoint_path(venue_id, year, row), {})
+        saved = payload.get("paper") if isinstance(payload, dict) else None
+        if not isinstance(saved, dict) or title_key(saved.get("title")) != title_key(row.get("title")):
+            continue
+        for key in ("abstract", "pdf_url"):
+            if clean(saved.get(key)):
+                row[key] = saved[key]
+        saved_metadata = saved.get("metadata") if isinstance(saved.get("metadata"), dict) else {}
+        if saved_metadata.get("indexed_enrichment"):
+            row.setdefault("metadata", {})["indexed_enrichment"] = saved_metadata["indexed_enrichment"]
+        if clean(row.get("abstract")):
+            restored += 1
+    return restored
+
+
+def _save_acm_checkpoint(venue_id: str, year: int, row: dict[str, Any]) -> None:
+    write_json(_acm_checkpoint_path(venue_id, year, row), {
+        "schema_version": 1,
+        "venue_id": venue_id,
+        "year": year,
+        "paper": row,
+    })
+
+
+def _write_acm_progress(venue_id: str, year: int, rows: list[dict[str, Any]], phase: str) -> None:
+    write_json(_acm_stage_dir(venue_id, year) / "progress.json", {
+        "schema_version": 1,
+        "venue_id": venue_id,
+        "year": year,
+        "phase": phase,
+        "total": len(rows),
+        "abstracts_complete": sum(bool(clean(row.get("abstract"))) for row in rows),
+        "remaining": sum(not clean(row.get("abstract")) for row in rows),
+    })
 
 
 def _batch_openalex_enrich(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -616,7 +763,8 @@ def _batch_openalex_enrich(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for offset in range(0, len(dois), 50):
         chunk = dois[offset:offset + 50]
         try:
-            response = get("https://api.openalex.org/works", params={"filter": "doi:" + "|".join(chunk), "per-page": 50, "select": "id,doi,display_name,abstract_inverted_index,best_oa_location,primary_location,authorships"}, timeout=90)
+            with bounded_request_policy(max_attempts=2, max_wait_seconds=15.0):
+                response = get("https://api.openalex.org/works", params={"filter": "doi:" + "|".join(chunk), "per-page": 50, "select": "id,doi,display_name,abstract_inverted_index,best_oa_location,primary_location,authorships"}, timeout=90)
             if not response.ok:
                 continue
             for item in response.json().get("results") or []:
@@ -644,7 +792,8 @@ def _batch_semantic_scholar_enrich(rows: list[dict[str, Any]]) -> list[dict[str,
     for offset in range(0, len(dois), 500):
         chunk = dois[offset:offset + 500]
         try:
-            response = post("https://api.semanticscholar.org/graph/v1/paper/batch", params={"fields": "title,abstract,openAccessPdf,externalIds"}, json_body={"ids": [f"DOI:{doi}" for doi in chunk]}, timeout=120)
+            with bounded_request_policy(max_attempts=2, max_wait_seconds=15.0):
+                response = post("https://api.semanticscholar.org/graph/v1/paper/batch", params={"fields": "title,abstract,openAccessPdf,externalIds"}, json_body={"ids": [f"DOI:{doi}" for doi in chunk]}, timeout=120)
             if not response.ok:
                 continue
             for item in response.json() or []:
@@ -813,10 +962,20 @@ def fetch_acm_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[st
         rows = _merge_title_rows(rows, official_rows) + missing_from_dblp
         for row in rows:
             row.setdefault("metadata", {})["official_title_pool_observed"] = title_key(row.get("title")) in official_keys
+    discovered_count = len(rows)
+    rows = _selected_rows(spec, rows)
+    probe_only = bool(_probe_limit(spec))
+    restored_checkpoints = 0 if probe_only else _restore_acm_checkpoints(venue_id, year, rows)
+    _batch_local_arxiv_enrich(rows)
     # TASTE permits indexed abstract enrichment for ACM venues, but never accepts
     # the DBLP title seed by itself as a verified cache.
     _batch_openalex_enrich(rows)
     _batch_semantic_scholar_enrich(rows)
+    if not probe_only:
+        for row in rows:
+            if clean(row.get("abstract")):
+                _save_acm_checkpoint(venue_id, year, row)
+        _write_acm_progress(venue_id, year, rows, "batch_index_enrichment")
     missing_rows = [row for row in rows if not clean(row.get("abstract"))]
     # ACM often challenges automated clients.  Probe serially and stop at the
     # first persisted cooldown so queued workers cannot each wait 60 seconds.
@@ -824,15 +983,47 @@ def fetch_acm_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[st
         if cooldown_remaining("acm") > 0:
             break
         _try_acm_pdf_abstract(row)
+        if not probe_only:
+            _save_acm_checkpoint(venue_id, year, row)
+            _write_acm_progress(venue_id, year, rows, "acm_pdf_enrichment")
     missing_rows = [row for row in rows if not clean(row.get("abstract"))]
     # Source cooldown is process-wide.  Keep fallback enrichment sequential so
     # workers cannot all pass a preflight check and then queue behind the same
     # newly-issued 403/429 cooldown.
+    try:
+        arxiv_budget = max(0, int(os.environ.get("RECOMMEND_PAPERS_ACM_ARXIV_FALLBACK_BUDGET", "12")))
+    except ValueError:
+        arxiv_budget = 12
+    arxiv_attempts = 0
     for row in missing_rows:
-        _indexed_enrich(row)
+        before = sum(item.get("source") == "arxiv_title_match_for_acm" for item in row.setdefault("metadata", {}).setdefault("indexed_enrichment", []))
+        _indexed_enrich(row, allow_remote_arxiv=probe_only or arxiv_attempts < arxiv_budget)
+        after = sum(item.get("source") == "arxiv_title_match_for_acm" and item.get("status") != "skipped_run_request_budget" for item in row["metadata"]["indexed_enrichment"])
+        arxiv_attempts += max(0, after - before)
+        if not probe_only:
+            _save_acm_checkpoint(venue_id, year, row)
+            _write_acm_progress(venue_id, year, rows, "indexed_fallback_enrichment")
     proof = "official_accepted_pool_merged_with_dblp_and_taste_indexed_abstract_enrichment" if official_rows else "complete_dblp_title_pool_with_taste_indexed_abstract_enrichment"
-    result_rows, details = _result(rows, adapter=f"{venue_id}_acm_enriched", requests=requests, proof=proof)
-    details.update({"official_title_pool_count": len(official_rows), "dblp_seed_count": len(rows) - max(0, len([row for row in official_rows if title_key(row.get('title')) not in seen]))})
+    result_rows, details = _finish_rows(
+        spec,
+        rows,
+        adapter=f"{venue_id}_acm_enriched",
+        requests=requests,
+        proof=proof,
+        discovered_count=discovered_count,
+    )
+    details.update({
+        "official_title_pool_count": len(official_rows),
+        "dblp_seed_count": discovered_count - max(0, len([row for row in official_rows if title_key(row.get('title')) not in seen])),
+        "restored_checkpoints": restored_checkpoints,
+        "checkpoint_mode": "disabled_for_probe" if probe_only else "per_paper_resumable",
+        "remote_arxiv_fallback_attempts": arxiv_attempts,
+        "remote_arxiv_fallback_budget": None if probe_only else arxiv_budget,
+    })
+    if not probe_only:
+        stage_dir = _acm_stage_dir(venue_id, year)
+        if stage_dir.is_dir():
+            shutil.rmtree(stage_dir)
     return result_rows, details
 
 

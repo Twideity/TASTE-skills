@@ -6,6 +6,7 @@ import re
 import threading
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -62,6 +63,10 @@ DEFAULT_CONCURRENCY = {
 }
 _locks_guard = threading.Lock()
 _semaphores: dict[tuple[str, int], threading.BoundedSemaphore] = {}
+_request_policy: ContextVar[dict[str, float | int | None]] = ContextVar(
+    "recommend_papers_request_policy",
+    default={"max_attempts": None, "max_wait_seconds": None, "deadline": None},
+)
 
 
 def service_for(url: str) -> str:
@@ -175,9 +180,10 @@ def _mutate_state(service: str, callback: Callable[[dict[str, Any]], None]) -> N
 
 
 @contextmanager
-def _cross_process_slot(service: str, limit: int) -> Iterator[None]:
+def _cross_process_slot(service: str, limit: int, *, max_wait_seconds: float | None = None) -> Iterator[None]:
     HTTP_STATE_ROOT.mkdir(parents=True, exist_ok=True)
     selected: FileLock | None = None
+    started = time.monotonic()
     while selected is None:
         for index in range(limit):
             candidate = FileLock(str(_slot_path(service, index)))
@@ -188,7 +194,12 @@ def _cross_process_slot(service: str, limit: int) -> Iterator[None]:
             except Timeout:
                 continue
         if selected is None:
-            time.sleep(0.05)
+            if max_wait_seconds is not None and time.monotonic() - started >= max_wait_seconds:
+                raise ServiceRequestDeferred(
+                    f"{service} request deferred while waiting for a cross-process slot ({max_wait_seconds:.1f}s budget exhausted)"
+                )
+            remaining = None if max_wait_seconds is None else max(0.0, max_wait_seconds - (time.monotonic() - started))
+            time.sleep(min(0.05, remaining) if remaining is not None else 0.05)
     try:
         yield
     finally:
@@ -202,34 +213,67 @@ def cooldown_remaining(service: str) -> float:
     return max(0.0, float(state.get("cooldown_until") or 0) - time.time())
 
 
+def _minimum_optional(current: float | int | None, requested: float | int) -> float | int:
+    return requested if current is None else min(current, requested)
+
+
+def _policy_remaining(policy: dict[str, float | int | None]) -> float | None:
+    deadline = policy.get("deadline")
+    return None if deadline is None else max(0.0, float(deadline) - time.monotonic())
+
+
 @contextmanager
-def request_slot(service: str) -> Iterator[None]:
+def bounded_request_policy(*, max_attempts: int, max_wait_seconds: float, wall_timeout_seconds: float = 30.0) -> Iterator[None]:
+    """Bound retries/cooldown waits for lightweight availability probes only."""
+    current = _request_policy.get()
+    requested_deadline = time.monotonic() + max(0.1, float(wall_timeout_seconds))
+    token = _request_policy.set({
+        "max_attempts": int(_minimum_optional(current.get("max_attempts"), max(1, int(max_attempts)))),
+        "max_wait_seconds": float(_minimum_optional(current.get("max_wait_seconds"), max(0.0, float(max_wait_seconds)))),
+        "deadline": float(_minimum_optional(current.get("deadline"), requested_deadline)),
+    })
+    try:
+        yield
+    finally:
+        _request_policy.reset(token)
+
+
+@contextmanager
+def request_slot(service: str, *, max_wait_seconds: float | None = None) -> Iterator[None]:
     limit = concurrency_limit(service)
     with _locks_guard:
         semaphore = _semaphores.setdefault((service, limit), threading.BoundedSemaphore(limit))
     with semaphore:
-        with _cross_process_slot(service, limit):
-            # Serialize only request start times and state updates.  The network
-            # transfer itself occupies one channel slot but does not hold up a
-            # different slot or any unrelated channel.
-            def reserve(state: dict[str, Any]) -> None:
-                now = time.time()
-                cooldown_until = float(state.get("cooldown_until") or 0)
-                if cooldown_until > now:
-                    remaining = cooldown_until - now
-                    if service == "dblp" and remaining > _positive_float_env("DBLP_MAX_RETRY_AFTER_WAIT_SEC", 10.0):
-                        raise ServiceRequestDeferred(
-                            f"DBLP request deferred for Retry-After cooldown ({remaining:.0f}s remaining)"
-                        )
-                    time.sleep(remaining)
-                now = time.time()
-                last_request = float(state.get("last_request_at") or 0)
-                wait = max(0.0, MIN_INTERVALS.get(service, MIN_INTERVALS["generic"]) - (now - last_request))
-                if wait:
-                    time.sleep(wait)
-                state["last_request_at"] = time.time()
+        with _cross_process_slot(service, limit, max_wait_seconds=max_wait_seconds):
+            # Never sleep while holding the state-file lock.  Recheck after
+            # sleeping so another process cannot reserve the same start time.
+            while True:
+                reservation = {"wait": 0.0, "ready": False}
 
-            _mutate_state(service, reserve)
+                def reserve(state: dict[str, Any]) -> None:
+                    now = time.time()
+                    cooldown_wait = max(0.0, float(state.get("cooldown_until") or 0) - now)
+                    spacing_wait = max(
+                        0.0,
+                        MIN_INTERVALS.get(service, MIN_INTERVALS["generic"])
+                        - (now - float(state.get("last_request_at") or 0)),
+                    )
+                    reservation["wait"] = max(cooldown_wait, spacing_wait)
+                    if reservation["wait"] <= 0:
+                        state["last_request_at"] = now
+                        reservation["ready"] = True
+
+                _mutate_state(service, reserve)
+                if reservation["ready"]:
+                    break
+                wait = float(reservation["wait"])
+                service_cap = _positive_float_env("DBLP_MAX_RETRY_AFTER_WAIT_SEC", 10.0) if service == "dblp" else None
+                effective_cap = max_wait_seconds if max_wait_seconds is not None else service_cap
+                if effective_cap is not None and wait > effective_cap:
+                    raise ServiceRequestDeferred(
+                        f"{service} request deferred for persisted cooldown/spacing ({wait:.1f}s remaining; wait budget {effective_cap:.1f}s)"
+                    )
+                time.sleep(wait)
             yield
 
 
@@ -290,9 +334,16 @@ def service_call(service: str, callback: Callable[[], Any], *, max_attempts: int
     others behind its back.
     """
     history: list[dict[str, Any]] = []
-    attempts = max(1, int(max_attempts or 1))
+    policy = _request_policy.get()
+    policy_attempts = policy.get("max_attempts")
+    attempts = max(1, int(policy_attempts if policy_attempts is not None else (max_attempts or 1)))
+    max_wait_seconds = policy.get("max_wait_seconds")
     for attempt in range(1, attempts + 1):
-        with request_slot(service):
+        remaining = _policy_remaining(policy)
+        if remaining is not None and remaining <= 0:
+            raise ServiceRequestDeferred(f"{service} request deferred: operation wall-clock budget exhausted")
+        slot_wait = min(float(max_wait_seconds), remaining) if max_wait_seconds is not None and remaining is not None else (float(max_wait_seconds) if max_wait_seconds is not None else remaining)
+        with request_slot(service, max_wait_seconds=slot_wait):
             try:
                 return callback(), history
             except Exception as exc:
@@ -339,14 +390,22 @@ def get(url: str, *, params: dict | None = None, headers: dict | None = None, ti
     response = None
     retry_history = []
     retryable_statuses = {429, 500, 502, 503, 504}
-    max_attempts = 8 if service == "arxiv" else 5
+    policy = _request_policy.get()
+    configured_attempts = policy.get("max_attempts")
+    max_wait_seconds = policy.get("max_wait_seconds")
+    max_attempts = max(1, int(configured_attempts)) if configured_attempts is not None else (8 if service == "arxiv" else 5)
     candidates = _dblp_url_candidates(url) if service == "dblp" else [url]
     candidate_index = 0
     for attempt in range(1, max_attempts + 1):
         candidate_url = candidates[min(candidate_index, len(candidates) - 1)]
         try:
-            with request_slot(service):
-                response = requests.get(candidate_url, params=params, headers=merged, timeout=timeout, stream=stream)
+            remaining = _policy_remaining(policy)
+            if remaining is not None and remaining <= 0:
+                raise ServiceRequestDeferred(f"{service} request deferred: operation wall-clock budget exhausted")
+            slot_wait = min(float(max_wait_seconds), remaining) if max_wait_seconds is not None and remaining is not None else (float(max_wait_seconds) if max_wait_seconds is not None else remaining)
+            request_timeout = min(float(timeout), max(0.1, remaining)) if remaining is not None else timeout
+            with request_slot(service, max_wait_seconds=slot_wait):
+                response = requests.get(candidate_url, params=params, headers=merged, timeout=request_timeout, stream=stream)
                 if response.status_code in retryable_statuses:
                     # DBLP's latest upstream adapter switches official mirrors
                     # immediately for transient server failures and uses its
@@ -384,10 +443,19 @@ def post(url: str, *, params: dict | None = None, json_body: dict | list | None 
         merged.update(headers)
     response = None
     retry_history = []
-    for attempt in range(1, 6):
+    policy = _request_policy.get()
+    configured_attempts = policy.get("max_attempts")
+    max_wait_seconds = policy.get("max_wait_seconds")
+    attempts = max(1, int(configured_attempts)) if configured_attempts is not None else 5
+    for attempt in range(1, attempts + 1):
         try:
-            with request_slot(service):
-                response = requests.post(url, params=params, json=json_body, headers=merged, timeout=timeout)
+            remaining = _policy_remaining(policy)
+            if remaining is not None and remaining <= 0:
+                raise ServiceRequestDeferred(f"{service} request deferred: operation wall-clock budget exhausted")
+            slot_wait = min(float(max_wait_seconds), remaining) if max_wait_seconds is not None and remaining is not None else (float(max_wait_seconds) if max_wait_seconds is not None else remaining)
+            request_timeout = min(float(timeout), max(0.1, remaining)) if remaining is not None else timeout
+            with request_slot(service, max_wait_seconds=slot_wait):
+                response = requests.post(url, params=params, json=json_body, headers=merged, timeout=request_timeout)
                 if response.status_code in {429, 500, 502, 503, 504}:
                     retry_after = _retry_after(response, min(300.0, 30.0 * (2 ** (attempt - 1))))
                     retry_history.append({"attempt": attempt, "status_code": response.status_code, "retry_after_seconds": retry_after})
@@ -398,11 +466,11 @@ def post(url: str, *, params: dict | None = None, json_body: dict | list | None 
                     _record_response(service, response.status_code)
         except requests.RequestException as exc:
             retry_history.append({"attempt": attempt, "error_type": type(exc).__name__, "message": str(exc)[:300]})
-            if attempt >= 5:
+            if attempt >= attempts:
                 raise
             time.sleep(min(8.0, float(2 ** (attempt - 1))))
             continue
-        if response.status_code in {429, 500, 502, 503, 504} and attempt < 5:
+        if response.status_code in {429, 500, 502, 503, 504} and attempt < attempts:
             continue
         setattr(response, "_taste_retry_history", retry_history)
         return response

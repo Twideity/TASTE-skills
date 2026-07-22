@@ -17,8 +17,8 @@ from urllib.parse import quote
 from bs4 import BeautifulSoup
 
 from .credentials import openreview_settings
-from .http import get, receipt, service_call
-from .storage import DATA_ROOT, METADATA_CACHE_ROOT, now_iso, read_json, stable_hash, write_json
+from .http import ServiceRequestDeferred, bounded_request_policy, get, receipt, service_call
+from .storage import DATA_ROOT, METADATA_CACHE_ROOT, now_iso, read_json, stable_hash, update_run, write_json
 from .venue_sources import fetch_official_venue
 
 
@@ -503,6 +503,7 @@ def fetch_dblp_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[s
         raise ValueError("Full DBLP venue crawl requires dblp_volume_url or dblp_volume_template")
     rows: list[dict[str, Any]] = []
     receipts: list[dict[str, Any]] = []
+    probe_limit = max(0, int(spec.get("_probe_limit") or 0))
     for year in years:
         url = template.format(year=year) if "{year}" in template else template
         response = None
@@ -544,7 +545,25 @@ def fetch_dblp_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[s
                 "identifiers": {"doi": doi, "dblp_key": key},
             })
             year_rows += 1
+            if probe_limit and len(rows) >= probe_limit:
+                break
         receipts[-1]["parsed_inproceedings"] = year_rows
+        if probe_limit and len(rows) >= probe_limit:
+            break
+    if probe_limit:
+        return rows[:probe_limit], {
+            "status": "sample_complete" if rows else "empty",
+            "probe_only": True,
+            "complete_catalog": False,
+            "exhausted": False,
+            "truncated": bool(rows),
+            "exhaustion_proof": "probe_sample_only_not_a_complete_catalog",
+            "requests": receipts,
+            "count": min(len(rows), probe_limit),
+            "sample_limit": probe_limit,
+            "metadata_sample_complete": bool(rows),
+            "adapter": "dblp",
+        }
     audit = venue_metadata_audit(rows)
     if not audit["metadata_completeness_ok"]:
         raise RuntimeError(f"DBLP venue metadata completeness audit failed: {audit}")
@@ -618,7 +637,10 @@ def _fetch_venue_exact(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict
 
 def fetch_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     requested_year = int((spec.get("years") or [0])[0])
-    candidates, reasons = _venue_year_candidates(spec)
+    # The year must already have been resolved by probe_venue.  Formal
+    # acquisition is exact-year and must never hide a failure by crawling an
+    # older edition or reusing an older cache.
+    candidates, reasons = [requested_year], []
     attempts: list[dict[str, Any]] = []
     last_error: Exception | None = None
     for year in candidates:
@@ -679,6 +701,7 @@ def fetch_openreview_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], 
         raise RuntimeError("OpenReview official client initialization failed after shared-channel retries")
     rows: list[dict[str, Any]] = []
     requests_info = []
+    probe_limit = max(0, int(spec.get("_probe_limit") or 0))
     for year in years:
         venue_id = clean(spec.get("openreview_venue_id"))
         if not venue_id:
@@ -686,7 +709,9 @@ def fetch_openreview_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             venue_id = template.format(year=year)
         offset = 0
         while True:
-            page_limit = 1000
+            page_limit = min(1000, probe_limit - len(rows)) if probe_limit else 1000
+            if page_limit <= 0:
+                break
             notes, retry_errors = service_call(
                 "openreview",
                 lambda: client.get_notes(content={"venueid": venue_id}, limit=page_limit, offset=offset),
@@ -717,9 +742,34 @@ def fetch_openreview_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], 
                     "identifiers": {"openreview_id": note_id, "doi": clean(_openreview_value(content.get("doi")))},
                 })
             offset += len(notes)
+            if probe_limit and len(rows) >= probe_limit:
+                break
             if len(notes) < page_limit:
                 break
             time.sleep(2.1)
+        if probe_limit and len(rows) >= probe_limit:
+            break
+    if probe_limit:
+        samples = rows[:probe_limit]
+        missing = sum(not clean(row.get("abstract")) for row in samples)
+        return samples, {
+            "status": "sample_complete" if samples and not missing else ("sample_partial" if samples else "empty"),
+            "probe_only": True,
+            "complete_catalog": False,
+            "exhausted": False,
+            "truncated": bool(samples),
+            "exhaustion_proof": "probe_sample_only_not_a_complete_catalog",
+            "client": "openreview-py",
+            "authenticated": settings["authenticated"],
+            "credential_file": str(settings["env_file"]),
+            "login_retry_errors": login_errors,
+            "requests": requests_info,
+            "count": len(samples),
+            "sample_limit": probe_limit,
+            "missing_sample_abstracts": missing,
+            "metadata_sample_complete": bool(samples) and missing == 0,
+            "adapter": "openreview",
+        }
     audit = venue_metadata_audit(rows, require_complete_abstracts=bool(spec.get("require_complete_abstracts")), require_official_categories=bool(spec.get("require_official_categories")))
     if not audit["metadata_completeness_ok"]:
         raise RuntimeError(f"OpenReview venue metadata completeness audit failed: {audit}")
@@ -1173,9 +1223,6 @@ def fetch_source(spec: dict[str, Any], *, policy: str, max_age_days: float) -> t
         papers, biorxiv_receipt = fetch_biorxiv_cached(spec, policy=policy, max_age_days=max_age_days)
         return papers, {"status": "cache_hit" if biorxiv_receipt["cache_status"] == "hit" else "cache_miss", "count": len(papers), "details": biorxiv_receipt}
     cache_specs = [spec]
-    if kind == "venue":
-        candidate_years, _ = _venue_year_candidates(spec)
-        cache_specs = [{**spec, "years": [year]} for year in candidate_years] or [spec]
     cache_paths = [_source_cache_path(item, stable_hash(item)) for item in cache_specs]
     cache_path = cache_paths[0]
     legacy_path = METADATA_CACHE_ROOT / f"{cache_key}.json"
@@ -1238,17 +1285,137 @@ def catalog(query: str = "") -> dict[str, Any]:
     return {"query": query, "count": len(venues), "venues": venues, "custom_venue_policy": "Use a built-in official adapter whenever the venue is catalogued. Custom venues may use OpenReview with an official venue ID or DBLP complete-volume XML, but title-only DBLP metadata is not a verified priority-venue corpus."}
 
 
-def probe_venue(spec: dict[str, Any], start_year: int, lookback: int, sample_limit: int) -> dict[str, Any]:
-    attempts = []
+def _probe_venue_exact(spec: dict[str, Any], sample_limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Fetch only a bounded exact-year sample; never invoke formal year fallback."""
+    venue_id = clean(spec.get("venue_id"))
+    known = next((item for item in DEFAULT_VENUES if item["id"] == venue_id), None)
+    merged = dict(known or {})
+    merged.update({key: value for key, value in spec.items() if value not in (None, "", [])})
+    adapter = clean(merged.get("adapter")).lower() or "dblp"
+    merged["adapter"] = adapter
+    merged["_probe_limit"] = max(1, int(sample_limit or 1))
+    merged.setdefault("venue", merged.get("name") or merged.get("query") or venue_id)
+    if adapter == "openreview":
+        return fetch_openreview_venue(merged)
+    if adapter == "dblp":
+        return fetch_dblp_venue(merged)
+    return fetch_official_venue(merged)
+
+
+def _transient_probe_error(exc: BaseException) -> bool:
+    if isinstance(exc, ServiceRequestDeferred):
+        return True
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in (
+        "429", "rate limit", "ratelimit", "too many requests", "timeout", "timed out",
+        "connection", "temporarily", "503", "502", "500", "cooldown", "deferred",
+    ))
+
+
+def probe_venue(
+    spec: dict[str, Any],
+    start_year: int,
+    lookback: int,
+    sample_limit: int,
+    run_dir: Path | None = None,
+) -> dict[str, Any]:
+    attempts: list[dict[str, Any]] = []
+    result: dict[str, Any] | None = None
     for year in range(start_year, start_year - max(1, lookback), -1):
-        candidate = dict(spec)
-        candidate["years"] = [year]
-        try:
-            rows, source_receipt = fetch_venue(candidate)
-            effective = [int(item) for item in source_receipt.get("effective_years") or [year]]
-            attempts.append({"requested_year": year, "effective_years": effective, "status": "available" if rows else "empty", "count": len(rows), "details": source_receipt})
-            if rows:
-                return {"requested_year": year, "resolved_year": effective[0], "year_fallback": effective[0] != year, "year_fallback_reason": source_receipt.get("year_fallback_reason", ""), "attempts": attempts, "samples": [normalize(row, "venue") for row in rows[:sample_limit]]}
-        except Exception as exc:
-            attempts.append({"year": year, "status": "error", "count": 0, "error_type": type(exc).__name__, "message": str(exc)[:500]})
-    return {"resolved_year": None, "attempts": attempts, "samples": []}
+        if not _regular_venue_year(clean(spec.get("venue_id")).lower(), year):
+            attempts.append({"year": year, "status": "not_scheduled", "count": 0})
+            continue
+        known = next((item for item in DEFAULT_VENUES if item["id"] == clean(spec.get("venue_id"))), {})
+        primary = clean(spec.get("adapter") or known.get("adapter")).lower()
+        adapters = list(dict.fromkeys(
+            item for item in [primary, *[clean(value).lower() for value in known.get("fallback_adapters") or []]] if item
+        )) or [""]
+        transient_for_year = False
+        error_for_year = False
+        for adapter in adapters:
+            candidate = dict(spec)
+            candidate["years"] = [year]
+            if adapter:
+                candidate["adapter"] = adapter
+            try:
+                # Match TASTE's probe semantics: one bounded title sample and
+                # short detail budget, never a hidden full venue crawl.
+                with bounded_request_policy(max_attempts=2, max_wait_seconds=5.0):
+                    rows, source_receipt = _probe_venue_exact(candidate, sample_limit)
+                attempts.append({"year": year, "adapter": adapter, "status": "available" if rows else "empty", "count": len(rows), "details": source_receipt})
+                if rows:
+                    result = {
+                        "status": "available",
+                        "requested_year": start_year,
+                        "resolved_year": year,
+                        "year_fallback": year != start_year,
+                        "year_fallback_reason": f"all configured {start_year} channels returned authoritative empty catalogs" if year != start_year else "",
+                        "attempts": attempts,
+                        "samples": [normalize(row, "venue") for row in rows[:sample_limit]],
+                        "probe_only": True,
+                        "formal_metadata_required": True,
+                    }
+                    break
+            except Exception as exc:
+                transient = _transient_probe_error(exc)
+                transient_for_year = transient_for_year or transient
+                error_for_year = True
+                attempts.append({
+                    "year": year,
+                    "adapter": adapter,
+                    "status": "transient_error" if transient else "error",
+                    "count": 0,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc)[:500],
+                })
+        if result is not None:
+            break
+        # A transient failure on any configured current-year route makes the
+        # year unresolved; it cannot authorize fallback to an older edition.
+        if transient_for_year:
+            result = {
+                "status": "temporarily_unresolved",
+                "requested_year": start_year,
+                "resolved_year": None,
+                "year_fallback": False,
+                "attempts": attempts,
+                "samples": [],
+                "probe_only": True,
+                "formal_metadata_required": True,
+            }
+            break
+        if error_for_year:
+            result = {
+                "status": "probe_error",
+                "requested_year": start_year,
+                "resolved_year": None,
+                "year_fallback": False,
+                "attempts": attempts,
+                "samples": [],
+                "probe_only": True,
+                "formal_metadata_required": True,
+            }
+            break
+    if result is None:
+        result = {
+            "status": "unavailable",
+            "requested_year": start_year,
+            "resolved_year": None,
+            "year_fallback": False,
+            "attempts": attempts,
+            "samples": [],
+            "probe_only": True,
+            "formal_metadata_required": True,
+        }
+    if run_dir is not None:
+        run_dir = run_dir.expanduser().resolve()
+        venue_key = re.sub(r"[^a-z0-9_.-]+", "_", clean(spec.get("venue_id") or spec.get("venue") or "venue").lower())
+        receipt_path = run_dir / "venue_probes" / f"{venue_key}-{start_year}.json"
+        payload = {"schema_version": 1, "created_at": now_iso(), "source": spec, **result}
+        write_json(receipt_path, payload)
+        state = read_json(run_dir / "run.json", {})
+        counts = dict(state.get("counts") or {}) if isinstance(state, dict) else {}
+        counts["venue_probes"] = len(list((run_dir / "venue_probes").glob("*.json")))
+        update_run(run_dir, stage="venue_probe", counts=counts)
+        result["receipt_path"] = str(receipt_path)
+    return result

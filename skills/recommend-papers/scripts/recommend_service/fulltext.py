@@ -10,14 +10,14 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 import fitz
 from bs4 import BeautifulSoup
 
 from .credentials import openreview_settings
 from .conference_sources import official_pdf_candidates
-from .http import cooldown_remaining, get, receipt, service_call, service_for
+from .http import bounded_request_policy, cooldown_remaining, get, receipt, service_call, service_for
 from .metadata import clean, paper_identity
 from .storage import FULLTEXT_CACHE_ROOT, now_iso, read_json, safe_write_target, stable_hash, update_run, write_json, write_text
 
@@ -230,6 +230,24 @@ def _candidate_urls(paper: dict[str, Any], *, include_oa_lookups: bool = True) -
 
     for candidate in official_pdf_candidates(paper):
         add(candidate["url"], candidate["kind"])
+    if not include_oa_lookups:
+        for page_url in (clean(paper.get("url")), clean((paper.get("metadata") or {}).get("url") if isinstance(paper.get("metadata"), dict) else "")):
+            if "eccv.ecva.net/virtual/" not in page_url.lower():
+                continue
+            try:
+                response = get(page_url, timeout=30)
+                receipts.append({"kind": "eccv_virtual_pdf_scan", **receipt(response)})
+                if not response.ok:
+                    continue
+                soup = BeautifulSoup(response.text, "html.parser")
+                for anchor in soup.find_all("a", href=True):
+                    absolute = urljoin(response.url, str(anchor.get("href") or ""))
+                    lowered = absolute.lower()
+                    if not lowered.endswith(".pdf") or any(token in lowered for token in ("-supp.pdf", "supplement", "poster", "slides")):
+                        continue
+                    add(absolute, "conference_official_pdf")
+            except Exception as exc:
+                receipts.append({"kind": "eccv_virtual_pdf_scan", "url": page_url, "status": "error", "error_type": type(exc).__name__, "message": str(exc)[:500]})
     add(paper.get("pdf_url"), "metadata_pdf")
     arxiv_id = _identifier(paper, "arxiv_id")
     if arxiv_id:
@@ -455,7 +473,7 @@ def _pmc_xml(paper: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     return "", attempts
 
 
-def acquire(paper: dict[str, Any], work_dir: Path) -> dict[str, Any]:
+def _acquire_with_bounded_requests(paper: dict[str, Any], work_dir: Path) -> dict[str, Any]:
     work_dir = safe_write_target(work_dir)
     downloads = work_dir / "downloads"
     extracted = work_dir / "extracted"
@@ -507,6 +525,20 @@ def acquire(paper: dict[str, Any], work_dir: Path) -> dict[str, Any]:
     }
 
 
+def acquire(paper: dict[str, Any], work_dir: Path) -> dict[str, Any]:
+    """Acquire one paper without allowing a server cooldown to pin a worker indefinitely."""
+    try:
+        wait_budget = max(0.0, float(os.environ.get("RECOMMEND_PAPERS_FULLTEXT_RETRY_AFTER_WAIT_CAP_SECONDS", "120") or 120))
+    except ValueError:
+        wait_budget = 120.0
+    try:
+        wall_budget = max(30.0, float(os.environ.get("RECOMMEND_PAPERS_FULLTEXT_REQUEST_WALL_BUDGET_SECONDS", "600") or 600))
+    except ValueError:
+        wall_budget = 600.0
+    with bounded_request_policy(max_attempts=5, max_wait_seconds=wait_budget, wall_timeout_seconds=wall_budget):
+        return _acquire_with_bounded_requests(paper, work_dir)
+
+
 def _transient_acquisition(*groups: list[dict[str, Any]]) -> dict[str, Any]:
     """Classify throttling/challenge failures without calling a paper absent."""
     services: set[str] = set()
@@ -522,6 +554,8 @@ def _transient_acquisition(*groups: list[dict[str, Any]]) -> dict[str, Any]:
         url = clean(item.get("url"))
         kind = clean(item.get("kind")).lower()
         reason = clean(item.get("reason") or item.get("status")).lower()
+        error_type = clean(item.get("error_type")).lower()
+        message = clean(item.get("message")).lower()
         status_code = int(item.get("status_code") or 0)
         is_openreview = inherited_openreview or "openreview" in kind or "openreview.net" in url
         detected_service = ""
@@ -542,6 +576,9 @@ def _transient_acquisition(*groups: list[dict[str, Any]]) -> dict[str, Any]:
             services.add(detected_service)
             reasons.add("openreview_403_challenge" if is_openreview else "http_403_access_challenge")
         if reason in {"skipped_cooldown", "service_cooldown_active", "openreview_service_cooldown_active"}:
+            services.add(detected_service)
+            reasons.add("service_cooldown_active")
+        if error_type == "servicerequestdeferred" or "request deferred" in message or "cooldown" in message and "deferred" in message:
             services.add(detected_service)
             reasons.add("service_cooldown_active")
         for value in item.values():
