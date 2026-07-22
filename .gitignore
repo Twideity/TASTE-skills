@@ -1,0 +1,38 @@
+# Secrets and local configuration
+*.env
+*.env.local
+*.pem
+*.key
+credentials.json
+secrets.*
+
+# Python-generated files and tool state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Runtime output must live under XDG state/cache roots, never in this repository
+runs/
+state/
+cache/
+.cache/
+metadata/
+fulltext/
+
+# Editors and operating systems
+.DS_Store
+**/.DS_Store
+.idea/
+*.swp
+*.swo
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/

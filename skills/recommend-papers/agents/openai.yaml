@@ -1,0 +1,4 @@
+interface:
+  display_name: "Recommend Papers"
+  short_description: "Codex-driven scholarly search, reading, and ranking"
+  default_prompt: "Use $recommend-papers with a compatible Python environment, keep all runtime files outside Git repositories, and recommend the most useful papers for my request."

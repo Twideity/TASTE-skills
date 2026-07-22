@@ -1,0 +1,14 @@
+name: taste
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - beautifulsoup4
+  - filelock
+  - pymupdf
+  - requests
+  - pytest
+  - pip
+  - pip:
+      - openreview-py==2.3.1
+      - python-dotenv>=1.0,<2

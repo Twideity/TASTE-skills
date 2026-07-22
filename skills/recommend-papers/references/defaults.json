@@ -1,0 +1,86 @@
+{
+  "metadata_shortlist": 100,
+  "final_recommendations": 20,
+  "cache_policy": "reuse",
+  "fulltext_workers": 8,
+  "deep_read_parallelism": {
+    "mode": "maximum_available_codex_subagents",
+    "papers_per_subagent": 1,
+    "refill_slots_until_queue_empty": true
+  },
+  "single_paper_read": {
+    "required_for_every_acquired_full_text": true,
+    "language": "zh-CN",
+    "cache_by_full_text_sha256": true
+  },
+  "storage": {
+    "state_root": "${XDG_STATE_HOME:-~/.local/state}/taste/recommend-papers",
+    "runs": "${XDG_STATE_HOME:-~/.local/state}/taste/recommend-papers/runs",
+    "cache": "${XDG_CACHE_HOME:-~/.cache}/taste/recommend-papers",
+    "metadata_cache": "${XDG_CACHE_HOME:-~/.cache}/taste/recommend-papers/metadata",
+    "visible_cache_directories": ["metadata", "fulltext"],
+    "allow_repository_writes": false
+  },
+  "baseline_channels": [
+    {
+      "type": "venue",
+      "name": "NeurIPS",
+      "aliases": ["NIPS"],
+      "venue_id": "neurips"
+    },
+    {
+      "type": "venue",
+      "name": "ICLR",
+      "venue_id": "iclr"
+    },
+    {
+      "type": "venue",
+      "name": "ICML",
+      "venue_id": "icml"
+    },
+    {
+      "type": "arxiv",
+      "name": "arXiv"
+    }
+  ],
+  "adaptive_channel_selection": {
+    "required": true,
+    "minimum_additional_channels": 1,
+    "maximum_additional_channels": 3,
+    "record_decisions": true,
+    "selection_basis": "highest_expected_value_for_research_topic"
+  },
+  "metadata_cache_max_age_days": 7,
+  "nonvenue_fetch_limit_per_source": 5000,
+  "retrieval_windows": {
+    "conference": {
+      "mode": "latest_available_metadata_year",
+      "year_count": 1,
+      "complete_catalog_required": true,
+      "result_limit_allowed": false
+    },
+    "arxiv": {
+      "mode": "trailing_calendar_months",
+      "months": 6,
+      "inclusive": true,
+      "complete_category_day_shards_required": true,
+      "cache_layout": "metadata/arxiv/<category>/<YYYY-MM-DD>.json",
+      "default_ai_categories": ["cs.AI", "cs.LG", "stat.ML", "cs.CL", "cs.CV", "cs.IR", "cs.RO", "eess.SY", "cs.MA", "cs.NE"]
+    },
+    "biorxiv": {
+      "mode": "trailing_calendar_months",
+      "months": 6,
+      "inclusive": true,
+      "complete_daily_shards_required": true,
+      "cache_layout": "metadata/biorxiv/<YYYY-MM-DD>.json",
+      "all_categories": true,
+      "result_limit_allowed": false,
+      "recent_recheck_days": 3,
+      "recent_recheck_max_age_days": 1
+    }
+  },
+  "final_score_dimensions": {
+    "match_score": 10,
+    "transferability_score": 10
+  }
+}
