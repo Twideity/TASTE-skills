@@ -259,6 +259,34 @@ def _candidate_urls(paper: dict[str, Any], *, include_oa_lookups: bool = True) -
             except Exception as exc:
                 receipts.append({"kind": "eccv_virtual_pdf_scan", "url": page_url, "status": "error", "error_type": type(exc).__name__, "message": str(exc)[:500]})
     add(paper.get("pdf_url"), "metadata_pdf")
+    if include_oa_lookups:
+        repository_urls = ((paper.get("metadata") or {}).get("openaire_repository_urls") or [])
+        for landing_url in repository_urls:
+            landing_url = clean(landing_url)
+            if not landing_url:
+                continue
+            try:
+                with bounded_request_policy(max_attempts=2, max_wait_seconds=5.0, wall_timeout_seconds=30.0):
+                    response = get(landing_url, timeout=30)
+                receipts.append({"kind": "openaire_repository_landing", **receipt(response)})
+                if not response.ok or "html" not in clean(response.headers.get("Content-Type")).lower():
+                    continue
+                soup = BeautifulSoup(response.text, "html.parser")
+                for node in soup.select('meta[name="citation_pdf_url"], meta[name="eprints.document_url"], a[href]'):
+                    value = clean(node.get("content") or node.get("href"))
+                    if not value:
+                        continue
+                    resolved = urljoin(response.url, value)
+                    if re.search(r"\.pdf(?:$|[?#])", resolved, re.I) or re.search(r"/bitstreams?/[^/?#]+/(?:download|content)(?:$|[?#])", resolved, re.I):
+                        add(resolved, "openaire_repository_exact_title_pdf")
+            except Exception as exc:
+                receipts.append({
+                    "kind": "openaire_repository_landing",
+                    "url": landing_url,
+                    "status": "error",
+                    "error_type": type(exc).__name__,
+                    "message": str(exc)[:500],
+                })
     arxiv_id = _identifier(paper, "arxiv_id")
     if arxiv_id:
         add(f"https://arxiv.org/pdf/{arxiv_id}", "arxiv_pdf")

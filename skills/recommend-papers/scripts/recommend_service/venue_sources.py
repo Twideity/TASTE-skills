@@ -49,6 +49,11 @@ def _semantic_scholar_headers() -> dict[str, str]:
     return {"x-api-key": api_key} if api_key else {}
 
 
+def _openaire_headers() -> dict[str, str]:
+    token = clean(os.environ.get("OPENAIRE_ACCESS_TOKEN"))
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 def stable_id(prefix: str, value: str) -> str:
     return f"{prefix}:{hashlib.sha256(value.encode('utf-8')).hexdigest()[:24]}"
 
@@ -763,6 +768,8 @@ def _restore_acm_checkpoints(venue_id: str, year: int, rows: list[dict[str, Any]
         saved_metadata = saved.get("metadata") if isinstance(saved.get("metadata"), dict) else {}
         if saved_metadata.get("indexed_enrichment"):
             row.setdefault("metadata", {})["indexed_enrichment"] = saved_metadata["indexed_enrichment"]
+        if saved_metadata.get("openaire_repository_urls"):
+            row.setdefault("metadata", {})["openaire_repository_urls"] = saved_metadata["openaire_repository_urls"]
         if clean(row.get("abstract")):
             restored += 1
     return restored
@@ -889,6 +896,200 @@ def _batch_semantic_scholar_enrich(rows: list[dict[str, Any]]) -> list[dict[str,
                     row.setdefault("metadata", {}).setdefault("indexed_enrichment", []).append({"source": "semantic_scholar_doi_for_acm_batch", **receipt(response)})
                 oa = item.get("openAccessPdf") if isinstance(item.get("openAccessPdf"), dict) else {}
                 row["pdf_url"] = clean(row.get("pdf_url")) or clean(oa.get("url"))
+        except Exception:
+            continue
+    return rows
+
+
+def _openaire_values(value: Any) -> list[str]:
+    """Flatten OpenAIRE's JSON-encoded XML scalar/list representation."""
+    values = value if isinstance(value, list) else [value]
+    result: list[str] = []
+    for item in values:
+        scalar = item.get("$") if isinstance(item, dict) else item
+        text = clean(scalar)
+        if text:
+            result.append(text)
+    return result
+
+
+def _openaire_pdf_url(result: dict[str, Any]) -> str:
+    pids = result.get("pid") if isinstance(result.get("pid"), list) else [result.get("pid")]
+    for item in pids:
+        if not isinstance(item, dict) or clean(item.get("@classid")).lower() != "arxiv":
+            continue
+        arxiv_id = clean(item.get("$"))
+        if arxiv_id:
+            return f"https://arxiv.org/pdf/{arxiv_id}"
+
+    children = result.get("children") if isinstance(result.get("children"), dict) else {}
+    child_rows = children.get("result") if isinstance(children.get("result"), list) else [children.get("result")]
+    for child in child_rows:
+        if not isinstance(child, dict):
+            continue
+        instances = child.get("instance") if isinstance(child.get("instance"), list) else [child.get("instance")]
+        for instance in instances:
+            if not isinstance(instance, dict):
+                continue
+            urls = _openaire_values(instance.get("url"))
+            web = instance.get("webresource")
+            if isinstance(web, dict):
+                urls.extend(_openaire_values(web.get("url")))
+            for url in urls:
+                if re.search(r"\.pdf(?:$|[?#])", url, re.I):
+                    return url
+                if re.search(r"arxiv\.org/abs/", url, re.I):
+                    return re.sub(r"/abs/", "/pdf/", url, flags=re.I)
+    return ""
+
+
+def _batch_openaire_enrich(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Use OpenAIRE's documented multi-DOI query for exact ACM enrichment.
+
+    Query only rows still missing an abstract.  This keeps an anonymous full
+    WWW run below OpenAIRE's hourly request allowance after the higher-yield
+    Semantic Scholar batch and prevents one-request-per-paper behavior.
+    """
+    if cooldown_remaining("openaire") > 15:
+        return rows
+    by_doi = {
+        clean((row.get("identifiers") or {}).get("doi")).lower(): row
+        for row in rows
+        if not clean(row.get("abstract")) and clean((row.get("identifiers") or {}).get("doi"))
+    }
+    dois = sorted(by_doi)
+    for offset in range(0, len(dois), 50):
+        chunk = dois[offset:offset + 50]
+        try:
+            with bounded_request_policy(max_attempts=2, max_wait_seconds=15.0):
+                response = get(
+                    "https://api.openaire.eu/search/publications",
+                    params={"doi": ",".join(chunk), "format": "json", "size": 100},
+                    headers=_openaire_headers(),
+                    timeout=90,
+                )
+            if not response.ok:
+                continue
+            results = (((response.json().get("response") or {}).get("results") or {}).get("result") or [])
+            if isinstance(results, dict):
+                results = [results]
+            for wrapper in results:
+                entity = ((wrapper.get("metadata") or {}).get("oaf:entity") or {}) if isinstance(wrapper, dict) else {}
+                item = entity.get("oaf:result") if isinstance(entity, dict) else None
+                if not isinstance(item, dict):
+                    continue
+                pids = item.get("pid") if isinstance(item.get("pid"), list) else [item.get("pid")]
+                record_dois = {
+                    clean(pid.get("$")).lower()
+                    for pid in pids
+                    if isinstance(pid, dict) and clean(pid.get("@classid")).lower() == "doi"
+                }
+                titles = _openaire_values(item.get("title"))
+                for doi in record_dois & by_doi.keys():
+                    row = by_doi[doi]
+                    if not any(title_key(title) == title_key(row.get("title")) for title in titles):
+                        continue
+                    descriptions = [value for value in _openaire_values(item.get("description")) if len(value) >= 80]
+                    if descriptions:
+                        row["abstract"] = max(descriptions, key=len)
+                    row["pdf_url"] = clean(row.get("pdf_url")) or _openaire_pdf_url(item)
+                    if clean(row.get("abstract")) or clean(row.get("pdf_url")):
+                        row.setdefault("metadata", {}).setdefault("indexed_enrichment", []).append({
+                            "source": "openaire_doi_for_acm_batch",
+                            **receipt(response),
+                        })
+        except Exception:
+            continue
+    return rows
+
+
+def _openaire_v3_locations(item: dict[str, Any]) -> tuple[str, list[str]]:
+    urls: list[str] = []
+    pids = item.get("pids") if isinstance(item.get("pids"), list) else []
+    for pid in pids:
+        if not isinstance(pid, dict):
+            continue
+        if clean(pid.get("scheme")).lower() == "arxiv" and clean(pid.get("value")):
+            urls.append(f"https://arxiv.org/pdf/{clean(pid.get('value'))}")
+    for instance in item.get("instances") or []:
+        if isinstance(instance, dict):
+            urls.extend(clean(url) for url in (instance.get("urls") or []) if clean(url))
+    urls = list(dict.fromkeys(urls))
+    direct = next((url for url in urls if re.search(r"\.pdf(?:$|[?#])", url, re.I)), "")
+    return direct, [url for url in urls if not re.fullmatch(r"https?://(?:dx\.)?doi\.org/.+", url, re.I)]
+
+
+def _openaire_v3_dois(item: dict[str, Any]) -> set[str]:
+    values: set[str] = set()
+    for pid in item.get("pids") or []:
+        if isinstance(pid, dict) and clean(pid.get("scheme")).lower() == "doi":
+            values.add(clean(pid.get("value")).lower())
+    for instance in item.get("instances") or []:
+        if not isinstance(instance, dict):
+            continue
+        for identifier in instance.get("alternateIdentifiers") or []:
+            if isinstance(identifier, dict) and clean(identifier.get("scheme")).lower() == "doi":
+                values.add(clean(identifier.get("value")).lower())
+    return values
+
+
+def _batch_openaire_title_enrich(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Resolve not-yet-registered ACM DOIs through exact OpenAIRE titles.
+
+    OpenAIRE accepts at most four logical operators, hence five titles per
+    request.  This path matters for current-year WWW records whose official
+    ACM DOI exists in the program before Crossref and DOI-based indexes ingest
+    it.  Exact normalized title equality remains mandatory.
+    """
+    if cooldown_remaining("openaire") > 15:
+        return rows
+    by_title = {
+        title_key(row.get("title")): row
+        for row in rows
+        if not clean(row.get("abstract")) and title_key(row.get("title"))
+    }
+    titles = [clean(row.get("title")).rstrip(".") for row in by_title.values()]
+    for offset in range(0, len(titles), 5):
+        chunk = [title.replace('"', "") for title in titles[offset:offset + 5]]
+        expression = "(" + " OR ".join(f'"{title}"' for title in chunk) + ")"
+        try:
+            with bounded_request_policy(max_attempts=2, max_wait_seconds=15.0):
+                response = get(
+                    "https://api.openaire.eu/graph/v3/research-products",
+                    params={"mainTitle": expression, "pageSize": 100},
+                    headers=_openaire_headers(),
+                    timeout=90,
+                )
+            if not response.ok:
+                continue
+            for item in response.json().get("results") or []:
+                # OpenAIRE can return a same-title companion dataset carrying
+                # the paper DOI.  Its dataset description is not a paper
+                # abstract and its files are not paper full text.
+                if not isinstance(item, dict) or clean(item.get("type")).lower() != "publication":
+                    continue
+                row = by_title.get(title_key(item.get("mainTitle")))
+                if row is None:
+                    continue
+                expected_doi = clean((row.get("identifiers") or {}).get("doi")).lower()
+                if expected_doi and expected_doi not in _openaire_v3_dois(item):
+                    continue
+                descriptions = [clean(value) for value in (item.get("descriptions") or []) if len(clean(value)) >= 80]
+                if descriptions:
+                    row["abstract"] = max(descriptions, key=len)
+                direct_pdf, repository_urls = _openaire_v3_locations(item)
+                row["pdf_url"] = clean(row.get("pdf_url")) or direct_pdf
+                if repository_urls:
+                    metadata = row.setdefault("metadata", {})
+                    metadata["openaire_repository_urls"] = list(dict.fromkeys([
+                        *(metadata.get("openaire_repository_urls") or []),
+                        *repository_urls,
+                    ]))
+                if clean(row.get("abstract")) or clean(row.get("pdf_url")) or repository_urls:
+                    row.setdefault("metadata", {}).setdefault("indexed_enrichment", []).append({
+                        "source": "openaire_exact_title_for_acm_batch",
+                        **receipt(response),
+                    })
         except Exception:
             continue
     return rows
@@ -1489,10 +1690,12 @@ def fetch_acm_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[st
     # the DBLP title seed by itself as a verified cache.
     _batch_openalex_enrich(rows)
     _batch_semantic_scholar_enrich(rows)
+    _batch_openaire_enrich(rows)
+    _batch_openaire_title_enrich(rows)
     chatpaper_stats = _chatpaper_enrich(rows, venue_id, year)
     if not probe_only:
         for row in rows:
-            if clean(row.get("abstract")):
+            if clean(row.get("abstract")) or clean(row.get("pdf_url")) or (row.get("metadata") or {}).get("openaire_repository_urls"):
                 _save_acm_checkpoint(venue_id, year, row)
         _write_acm_progress(venue_id, year, rows, "batch_index_enrichment")
     missing_rows = [row for row in rows if not clean(row.get("abstract"))]
@@ -1510,12 +1713,18 @@ def fetch_acm_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[st
     # workers cannot all pass a preflight check and then queue behind the same
     # newly-issued 403/429 cooldown.
     openalex_wait = cooldown_remaining("openalex")
-    if not probe_only and len(missing_rows) > 50 and openalex_wait > 300:
-        _write_acm_progress(venue_id, year, rows, "deferred_openalex_daily_cooldown")
+    openaire_wait = cooldown_remaining("openaire")
+    if not probe_only and len(missing_rows) > 50 and max(openalex_wait, openaire_wait) > 300:
+        _write_acm_progress(venue_id, year, rows, "deferred_index_budget_cooldown")
+        budget_notes = []
+        if openalex_wait > 0:
+            budget_notes.append(f"OpenAlex budget has {round(openalex_wait)} seconds remaining")
+        if openaire_wait > 0:
+            budget_notes.append(f"OpenAIRE anonymous hourly budget has {round(openaire_wait)} seconds remaining")
         raise RuntimeError(
             f"{venue_id}_acm_enriched deferred with {len(missing_rows)} abstracts remaining; "
-            f"OpenAlex shared cooldown has {round(openalex_wait)} seconds remaining. "
-            "Per-paper fallbacks were not expanded into a long serial wait; resume this exact source after the cooldown."
+            f"{'; '.join(budget_notes)}. Per-paper fallbacks were not expanded into a long serial wait; "
+            "resume this exact source after the reported channel budgets reset."
         )
     try:
         arxiv_budget = max(0, int(os.environ.get("RECOMMEND_PAPERS_ACM_ARXIV_FALLBACK_BUDGET", "12")))

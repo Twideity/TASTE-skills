@@ -63,3 +63,29 @@ OA copies therefore remain necessary unless an authorized ACM TDM API is
 configured. OpenAlex changed in 2026 to require a free API key for normal
 at-scale use; anonymous calls can exhaust a shared daily allowance and must not
 be expanded into hours of serial backoff.
+
+WWW follow-up validation on 2026-07-23 quantified the indexed fallbacks against
+all 1,191 DOI-bearing rows. The existing cache had 213 abstracts. Semantic
+Scholar's DOI batch returned 1,188 exact identities and raised the union to
+1,071 abstracts. OpenAIRE's legacy multi-DOI search added two exact abstracts;
+its v3 exact-title API found all 118 then-unresolved publication identities and
+added two more abstracts, including FovRL and FediScan from Aaltodoc. Their
+repository PDFs extracted 58,331 and 65,405 characters and passed title/author
+identity checks. A same-title Zenodo dataset carrying the paper DOI was tested
+and rejected: its dataset description is not the paper abstract. The verified
+union is therefore 1,075/1,191 abstracts, with 116 still awaiting a real paper
+abstract or identity-validated full text. HAL returned
+zero records for a 50-DOI sample, and ten evenly
+spaced unresolved DOI lookups all returned Crossref 404. Thus the remaining
+gap is a late-indexing cohort, not evidence that the papers do not exist.
+OpenAIRE DOI and exact-title routes must both run, repository locations must be
+cached for later full-text acquisition, and a keyed OpenAlex quota must use a
+credential-scoped cooldown rather than inherit an exhausted anonymous state.
+
+A formal refresh after the channel audit merged 1,212 official-schedule/DBLP
+candidates, checkpointed 1,071 verified abstracts, and correctly refused to
+publish the incomplete corpus with 141 remaining. This run exhausted the
+anonymous OpenAIRE 60-request hourly window accumulated during validation while
+the anonymous OpenAlex daily state was already exhausted. Both waits must be
+reported; resume the same source after reset instead of silently retrying every
+paper or treating the partial checkpoint as a complete metadata cache.

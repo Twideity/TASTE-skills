@@ -200,8 +200,20 @@ def _run_metadata_locked(plan_path: Path, directory: Path) -> dict[str, Any]:
             warning = f"Source {index} coverage is {coverage_status}; inspect receipt and repair before scoring" if coverage_status != "complete" else ""
         except Exception as exc:
             papers = []
-            row = {"index": index, "source": spec, "status": "error", "paper_count": 0, "error_type": type(exc).__name__, "message": str(exc)[:1000]}
-            warning = f"Source {index} failed: {type(exc).__name__}: {str(exc)[:200]}"
+            root = exc
+            while root.__cause__ is not None:
+                root = root.__cause__
+            row = {
+                "index": index,
+                "source": spec,
+                "status": "error",
+                "paper_count": 0,
+                "error_type": type(exc).__name__,
+                "message": str(exc)[:1000],
+                "root_error_type": type(root).__name__,
+                "root_message": str(root)[:1000],
+            }
+            warning = f"Source {index} failed: {type(root).__name__}: {str(root)[:500]}"
         return index, papers, row, warning
 
     try:

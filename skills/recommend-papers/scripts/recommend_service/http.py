@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -31,6 +32,10 @@ MIN_INTERVALS = {
     "unpaywall": 0.25,
     "acm": 0.5,
     "semantic_scholar": 0.5,
+    # The anonymous OpenAIRE Search API is limited to 60 requests/hour.  ACM
+    # enrichment batches many DOI values into one request, but keep starts
+    # serialized and conservatively spaced as well.
+    "openaire": 1.1,
     "hal": 0.5,
     "chatpaper": 10.1,
     "generic": 0.25,
@@ -51,6 +56,7 @@ DEFAULT_CONCURRENCY = {
     "unpaywall": 2,
     "acm": 1,
     "semantic_scholar": 2,
+    "openaire": 1,
     "hal": 3,
     "chatpaper": 1,
     "host-aclanthology.org": 6,
@@ -93,6 +99,8 @@ def service_for(url: str) -> str:
         return "acm"
     if "semanticscholar.org" in host:
         return "semantic_scholar"
+    if "openaire.eu" in host:
+        return "openaire"
     if "archives-ouvertes.fr" in host:
         return "hal"
     if host == "chatpaper.com" or host.endswith(".chatpaper.com"):
@@ -102,6 +110,25 @@ def service_for(url: str) -> str:
     # host merely because both previously fell into a global "generic" bucket.
     normalized = re.sub(r"[^a-z0-9.-]+", "_", host.split(":", 1)[0])
     return f"host-{normalized}" if normalized else "generic"
+
+
+def _service_family(service: str) -> str:
+    return service.split("--", 1)[0]
+
+
+def _effective_service(service: str) -> str:
+    """Keep keyed OpenAlex traffic out of an exhausted anonymous quota state."""
+    if service == "openalex":
+        api_key = str(os.environ.get("OPENALEX_API_KEY") or "").strip()
+        if api_key:
+            digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+            return f"openalex--key-{digest}"
+    if service == "openaire":
+        token = str(os.environ.get("OPENAIRE_ACCESS_TOKEN") or "").strip()
+        if token:
+            digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+            return f"openaire--token-{digest}"
+    return service
 
 
 def _state_path(service: str) -> Path:
@@ -162,13 +189,14 @@ def concurrency_limit(service: str) -> int:
             configured = payload if isinstance(payload, dict) else {}
         except (TypeError, ValueError):
             configured = {}
-    fallback = configured.get("default_host") if service.startswith("host-") else configured.get("generic")
-    value = configured.get(service, DEFAULT_CONCURRENCY.get(service, fallback if fallback is not None else DEFAULT_CONCURRENCY["generic"]))
+    family = _service_family(service)
+    fallback = configured.get("default_host") if family.startswith("host-") else configured.get("generic")
+    value = configured.get(service, configured.get(family, DEFAULT_CONCURRENCY.get(family, fallback if fallback is not None else DEFAULT_CONCURRENCY["generic"])))
     try:
-        ceiling = 3 if service == "openreview" else 32
+        ceiling = 3 if family == "openreview" else 32
         return max(1, min(ceiling, int(value)))
     except (TypeError, ValueError):
-        return DEFAULT_CONCURRENCY.get(service, DEFAULT_CONCURRENCY["generic"])
+        return DEFAULT_CONCURRENCY.get(family, DEFAULT_CONCURRENCY["generic"])
 
 
 def _mutate_state(service: str, callback: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
@@ -212,6 +240,7 @@ def _cross_process_slot(service: str, limit: int, *, max_wait_seconds: float | N
 
 
 def cooldown_remaining(service: str) -> float:
+    service = _effective_service(service)
     state = read_json(_state_path(service), {})
     if not isinstance(state, dict):
         return 0.0
@@ -223,8 +252,18 @@ def cooldown_remaining(service: str) -> float:
                     current.pop(key, None)
 
         current = _mutate_state(service, clear_expired)
-        return max(0.0, float(current.get("cooldown_until") or 0) - time.time())
-    return max(0.0, remaining)
+        remaining = float(current.get("cooldown_until") or 0) - time.time()
+        state = current
+    hourly_remaining = 0.0
+    if service == "openaire":
+        now = time.time()
+        timestamps = sorted(
+            float(value) for value in (state.get("request_timestamps") or [])
+            if now - float(value) < 3600.0
+        )
+        if len(timestamps) >= 60:
+            hourly_remaining = max(0.0, timestamps[0] + 3600.0 - now)
+    return max(0.0, remaining, hourly_remaining)
 
 
 def _minimum_optional(current: float | int | None, requested: float | int) -> float | int:
@@ -254,6 +293,8 @@ def bounded_request_policy(*, max_attempts: int, max_wait_seconds: float, wall_t
 
 @contextmanager
 def request_slot(service: str, *, max_wait_seconds: float | None = None) -> Iterator[None]:
+    service = _effective_service(service)
+    family = _service_family(service)
     limit = concurrency_limit(service)
     with _locks_guard:
         semaphore = _semaphores.setdefault((service, limit), threading.BoundedSemaphore(limit))
@@ -272,12 +313,23 @@ def request_slot(service: str, *, max_wait_seconds: float | None = None) -> Iter
                     cooldown_wait = max(0.0, float(state.get("cooldown_until") or 0) - now)
                     spacing_wait = max(
                         0.0,
-                        MIN_INTERVALS.get(service, MIN_INTERVALS["generic"])
+                        MIN_INTERVALS.get(family, MIN_INTERVALS["generic"])
                         - (now - float(state.get("last_request_at") or 0)),
                     )
-                    reservation["wait"] = max(cooldown_wait, spacing_wait)
+                    hourly_wait = 0.0
+                    if service == "openaire":
+                        timestamps = [
+                            float(value) for value in (state.get("request_timestamps") or [])
+                            if now - float(value) < 3600.0
+                        ]
+                        state["request_timestamps"] = timestamps
+                        if len(timestamps) >= 60:
+                            hourly_wait = max(0.0, timestamps[0] + 3600.0 - now)
+                    reservation["wait"] = max(cooldown_wait, spacing_wait, hourly_wait)
                     if reservation["wait"] <= 0:
                         state["last_request_at"] = now
+                        if service == "openaire":
+                            state.setdefault("request_timestamps", []).append(now)
                         reservation["ready"] = True
 
                 _mutate_state(service, reserve)
@@ -285,8 +337,8 @@ def request_slot(service: str, *, max_wait_seconds: float | None = None) -> Iter
                     break
                 wait = float(reservation["wait"])
                 service_cap = (
-                    _positive_float_env("DBLP_MAX_RETRY_AFTER_WAIT_SEC", 10.0) if service == "dblp"
-                    else _positive_float_env("ACM_MAX_COOLDOWN_WAIT_SEC", 5.0) if service == "acm"
+                    _positive_float_env("DBLP_MAX_RETRY_AFTER_WAIT_SEC", 10.0) if family == "dblp"
+                    else _positive_float_env("ACM_MAX_COOLDOWN_WAIT_SEC", 5.0) if family == "acm"
                     else None
                 )
                 effective_cap = (
@@ -409,7 +461,8 @@ def service_call(service: str, callback: Callable[[], Any], *, max_attempts: int
 
 
 def get(url: str, *, params: dict | None = None, headers: dict | None = None, timeout: int = DEFAULT_TIMEOUT, stream: bool = False) -> requests.Response:
-    service = service_for(url)
+    service = _effective_service(service_for(url))
+    family = _service_family(service)
     merged = {"User-Agent": USER_AGENT, "Accept": "*/*"}
     if headers:
         merged.update(headers)
@@ -419,8 +472,8 @@ def get(url: str, *, params: dict | None = None, headers: dict | None = None, ti
     policy = _request_policy.get()
     configured_attempts = policy.get("max_attempts")
     max_wait_seconds = policy.get("max_wait_seconds")
-    max_attempts = max(1, int(configured_attempts)) if configured_attempts is not None else (8 if service == "arxiv" else 5)
-    candidates = _dblp_url_candidates(url) if service == "dblp" else [url]
+    max_attempts = max(1, int(configured_attempts)) if configured_attempts is not None else (8 if family == "arxiv" else 5)
+    candidates = _dblp_url_candidates(url) if family == "dblp" else [url]
     candidate_index = 0
     for attempt in range(1, max_attempts + 1):
         candidate_url = candidates[min(candidate_index, len(candidates) - 1)]
@@ -436,7 +489,7 @@ def get(url: str, *, params: dict | None = None, headers: dict | None = None, ti
                     # DBLP's latest upstream adapter switches official mirrors
                     # immediately for transient server failures and uses its
                     # one-second channel spacing when 429 omits Retry-After.
-                    fallback = (1.0 if response.status_code == 429 else 0.0) if service == "dblp" else min(300.0, 30.0 * (2 ** (attempt - 1)))
+                    fallback = (1.0 if response.status_code == 429 else 0.0) if family == "dblp" else min(300.0, 30.0 * (2 ** (attempt - 1)))
                     retry_after = _retry_after(response, fallback)
                     retry_history.append({"attempt": attempt, "status_code": response.status_code, "retry_after_seconds": retry_after})
                     _record_response(service, response.status_code, retry_after, attempt)
@@ -446,14 +499,14 @@ def get(url: str, *, params: dict | None = None, headers: dict | None = None, ti
                     _record_response(service, response.status_code)
         except requests.RequestException as exc:
             retry_history.append({"attempt": attempt, "error_type": type(exc).__name__, "message": str(exc)[:300]})
-            if service == "dblp":
+            if family == "dblp":
                 candidate_index = min(candidate_index + 1, len(candidates) - 1)
             if attempt >= max_attempts:
                 raise
             time.sleep(min(8.0, float(2 ** (attempt - 1))))
             continue
         if response.status_code in retryable_statuses and attempt < max_attempts:
-            if service == "dblp" and response.status_code != 429:
+            if family == "dblp" and response.status_code != 429:
                 candidate_index = min(candidate_index + 1, len(candidates) - 1)
             continue
         setattr(response, "_taste_retry_history", retry_history)
@@ -463,7 +516,7 @@ def get(url: str, *, params: dict | None = None, headers: dict | None = None, ti
 
 
 def post(url: str, *, params: dict | None = None, json_body: dict | list | None = None, headers: dict | None = None, timeout: int = DEFAULT_TIMEOUT) -> requests.Response:
-    service = service_for(url)
+    service = _effective_service(service_for(url))
     merged = {"User-Agent": USER_AGENT, "Accept": "application/json", "Content-Type": "application/json"}
     if headers:
         merged.update(headers)
