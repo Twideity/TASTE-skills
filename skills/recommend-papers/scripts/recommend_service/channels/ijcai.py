@@ -8,7 +8,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from .base import Channel
 from .conference_common import complete_abstract_catalog
-from .runtime import clean, finish, looks_like_title, response
+from .runtime import AuthoritativeEmptyCatalog, clean, finish, looks_like_title, response, worker_count
 from .shared import explicit_pdf, official_pdf_abstract, values_blob
 from ..http import get, receipt
 from ..storage import DATA_ROOT, read_json, write_json
@@ -16,7 +16,7 @@ ID="ijcai"; SOURCE="IJCAI Proceedings"
 def _key(v):return re.sub(r"[^a-z0-9]+"," ",clean(v).lower()).strip()
 def _checkpoint(year:int,row:dict[str,Any])->Path:
     digest=hashlib.sha256(_key(row.get("title")).encode()).hexdigest()
-    return DATA_ROOT/"state"/"venue-staging"/ID/str(year)/f"{digest}.json"
+    return DATA_ROOT/"state"/"venue-staging"/ID/str(year)/"ijcai_proceedings"/f"{digest}.json"
 def _enrich(year:int,row:dict[str,Any])->None:
     path=_checkpoint(year,row); saved=read_json(path,{})
     paper=saved.get("paper") if isinstance(saved,dict) else None
@@ -52,16 +52,20 @@ def fetch_metadata(spec):
     year=int(spec["years"][0]); list_url=f"https://www.ijcai.org/proceedings/{year}/"; r=get(list_url,timeout=60); requests=[receipt(r)]; rows=[]
     if r.ok:
         s=BeautifulSoup(r.text,"html.parser")
-        for wrapper in s.select("div.paper_wrapper"):
+        wrappers=s.select("div.paper_wrapper")
+        for wrapper in wrappers:
             t=wrapper.select_one(".title"); title=clean(t.get_text(" ",strip=True) if t else "")
             if not looks_like_title(title):continue
             authors=wrapper.select_one(".authors"); detail=wrapper.select_one("a[href*='/proceedings/'][href]"); pdf=wrapper.find("a",string=re.compile("pdf",re.I))
             rows.append({"title":title,"abstract":"","authors":[clean(authors.get_text(" ",strip=True))] if authors else [],"published":f"{year}-01-01","year":year,"url":urljoin(list_url,str(detail.get("href"))) if detail else "","pdf_url":urljoin(list_url,str(pdf.get("href"))) if pdf else "","venue":"IJCAI","categories":[],"identifiers":{},"metadata":{"official_index":list_url}})
     if rows:
-        with ThreadPoolExecutor(max_workers=max(1,min(4,len(rows)))) as pool:list(pool.map(lambda row:_enrich(year,row),rows))
-        return finish(spec,rows,adapter="ijcai_proceedings",requests=requests,proof="official_ijcai_index_exhausted_and_all_details_enriched",discovered_count=len(rows))
-    url=f"https://{year}.ijcai.org/accepted-papers/"; accepted=response(url); requests.append(receipt(accepted)); rows=_accepted(accepted.text,year,url)
-    return finish(spec,rows,adapter="ijcai_accepted_papers",requests=requests,proof="official_ijcai_accepted_papers_page_exhausted",discovered_count=len(rows))
+        with ThreadPoolExecutor(max_workers=max(1,min(worker_count(spec,8),len(rows)))) as pool:list(pool.map(lambda row:_enrich(year,row),rows))
+        return finish(spec,rows,adapter="ijcai_proceedings",requests=requests,proof="official_ijcai_index_exhausted_and_all_details_enriched",discovered_count=len(wrappers))
+    url=f"https://{year}.ijcai.org/accepted-papers/"; accepted=get(url,timeout=60)
+    if accepted.status_code==404 and r.status_code==404: raise AuthoritativeEmptyCatalog(f"IJCAI has no proceedings or accepted-paper catalog for {year}")
+    if accepted.status_code==404 and not r.ok: r.raise_for_status()
+    accepted.raise_for_status(); requests.append(receipt(accepted)); rows=_accepted(accepted.text,year,url); accepted_count=len(BeautifulSoup(accepted.text,"html.parser").select(".ij-paper"))
+    return finish(spec,rows,adapter="ijcai_accepted_papers",requests=requests,proof="official_ijcai_accepted_papers_page_exhausted",discovered_count=accepted_count)
 def pdf_candidates(paper:dict[str,Any]):
     rows=explicit_pdf(paper,"ijcai_official_pdf",SOURCE)
     for year,pid in re.findall(r"ijcai\.org/proceedings/(\d{4})/(\d+)",values_blob(paper)):

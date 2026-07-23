@@ -40,14 +40,21 @@ class Channel:
     ) -> tuple[bool, dict[str, Any]]:
         if payload.get("channel") not in (None, self.id):
             return False, {"reason": "channel_mismatch"}
-        if int(payload.get("schema_version") or 0) != self.metadata_schema:
-            return False, {"reason": "schema_version_mismatch"}
-        return self.cache_validator(payload, spec)
+        try:
+            if int(payload.get("schema_version") or 0) != self.metadata_schema:
+                return False, {"reason": "schema_version_mismatch"}
+            return self.cache_validator(payload, spec)
+        except (KeyError, TypeError, ValueError) as exc:
+            return False, {
+                "reason": "cache_contract_error",
+                "error_type": type(exc).__name__,
+            }
 
     def fetch_metadata(
         self, spec: dict[str, Any]
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        rows, receipt = self.metadata_fetcher(spec)
+        runtime_spec = {**spec, "_channel_metadata_workers": self.metadata_workers}
+        rows, receipt = self.metadata_fetcher(runtime_spec)
         years = [int(value) for value in spec.get("years") or []]
         receipt = dict(receipt)
         receipt.update({

@@ -11,6 +11,7 @@ from typing import Any
 from .channels.registry import canonical as canonical_channel
 from .fulltext import acquire_many
 from .metadata import clean, deduplicate, fetch_source, migrate_metadata_caches, paper_identity, validate_plan
+from .channels.runtime import AuthoritativeEmptyCatalog, IncompleteCatalogError
 from .reading_artifacts import READ_CONTRACT_VERSION
 from .storage import now_iso, read_json, require_run, run_lock, stable_hash, update_run, write_json, write_text
 
@@ -148,17 +149,30 @@ def _run_metadata_locked(plan_path: Path, directory: Path) -> dict[str, Any]:
             root = exc
             while root.__cause__ is not None:
                 root = root.__cause__
+            source_status = (
+                "authoritative_empty"
+                if isinstance(root, AuthoritativeEmptyCatalog)
+                else "incomplete"
+                if isinstance(root, IncompleteCatalogError)
+                else "error"
+            )
             row = {
                 "index": index,
                 "source": spec,
-                "status": "error",
+                "status": source_status,
                 "paper_count": 0,
                 "error_type": type(exc).__name__,
                 "message": str(exc)[:1000],
                 "root_error_type": type(root).__name__,
                 "root_message": str(root)[:1000],
+                "authoritative_empty": source_status == "authoritative_empty",
             }
-            warning = f"Source {index} failed: {type(root).__name__}: {str(root)[:500]}"
+            if source_status == "authoritative_empty":
+                warning = f"Source {index} is authoritatively empty: {str(root)[:500]}"
+            elif source_status == "incomplete":
+                warning = f"Source {index} catalog is incomplete: {str(root)[:500]}"
+            else:
+                warning = f"Source {index} failed: {type(root).__name__}: {str(root)[:500]}"
         return index, papers, row, warning
 
     try:

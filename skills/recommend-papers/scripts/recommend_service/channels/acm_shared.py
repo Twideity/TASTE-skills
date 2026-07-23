@@ -22,6 +22,7 @@ from bs4 import BeautifulSoup
 import fitz
 from filelock import FileLock
 
+from .runtime import finish, worker_count
 from ..http import bounded_request_policy, cooldown_remaining, get, post, receipt
 from ..storage import DATA_ROOT, METADATA_CACHE_ROOT, read_json, write_json
 
@@ -218,22 +219,8 @@ def _enrich_all(rows: list[dict[str, Any]], worker_count: int = 8) -> list[dict[
     return rows
 
 
-def _result(rows: list[dict[str, Any]], *, adapter: str, requests: list[dict[str, Any]], proof: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    missing = [row.get("title") for row in rows if not clean(row.get("abstract"))]
-    if not rows or missing:
-        raise RuntimeError(
-            f"{adapter} full-metadata crawl incomplete: records={len(rows)}, "
-            f"missing_abstracts={len(missing)}, examples={missing[:5]}"
-        )
-    return rows, {
-        "status": "complete", "complete_catalog": True, "exhausted": True,
-        "truncated": False, "exhaustion_proof": proof, "adapter": adapter,
-        "count": len(rows), "requests": requests,
-    }
-
-
 def _detail_workers(spec: dict[str, Any], formal_workers: int = 8) -> int:
-    return formal_workers
+    return worker_count(spec, formal_workers)
 
 
 def _selected_rows(spec: dict[str, Any], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -249,7 +236,14 @@ def _finish_rows(
     proof: str,
     discovered_count: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    return _result(rows, adapter=adapter, requests=requests, proof=proof)
+    return finish(
+        spec,
+        rows,
+        adapter=adapter,
+        requests=requests,
+        proof=proof,
+        discovered_count=discovered_count,
+    )
 
 
 def _openalex_abstract(index: Any) -> str:
@@ -1470,7 +1464,7 @@ def fetch_acm_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[st
         )
         for row in missing_rows
     }
-    with ThreadPoolExecutor(max_workers=max(1, min(8, len(missing_rows)))) as pool:
+    with ThreadPoolExecutor(max_workers=max(1, min(_detail_workers(spec), len(missing_rows)))) as pool:
         futures = {pool.submit(_indexed_enrich, row, allow_remote_arxiv=True): row for row in missing_rows}
         for future in as_completed(futures):
             row = futures[future]

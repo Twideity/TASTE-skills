@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -14,16 +15,18 @@ from urllib.parse import quote, urljoin
 
 import fitz
 from bs4 import BeautifulSoup
+from filelock import FileLock
 
 from .credentials import openreview_settings
 from .channels import channel_for_paper
 from .http import bounded_request_policy, cooldown_remaining, get, receipt, service_call, service_for
 from .metadata import clean, paper_identity
-from .storage import FULLTEXT_CACHE_ROOT, now_iso, read_json, safe_write_target, stable_hash, update_run, write_json, write_text
+from .storage import DATA_ROOT, FULLTEXT_CACHE_ROOT, now_iso, read_json, safe_write_target, stable_hash, update_run, write_json, write_text
 
 
 MIN_FULL_TEXT_CHARS = 1200
-ACQUISITION_SCHEMA_VERSION = 2
+MIN_HTML_FULL_TEXT_CHARS = 4000
+ACQUISITION_SCHEMA_VERSION = 3
 _cache_publish_lock = threading.Lock()
 _openreview_client_lock = threading.Lock()
 _openreview_client_cache: dict[tuple[str, str], tuple[Any, dict[str, Any]]] = {}
@@ -114,10 +117,37 @@ def _identity_ok(paper: dict[str, Any], text: str) -> bool:
     )
 
 
-def _body_ok(text: str) -> bool:
-    lower = text.lower()
-    markers = sum(marker in lower for marker in ("abstract", "introduction", "method", "methods", "results", "discussion", "references", "conclusion"))
-    return len(text) >= MIN_FULL_TEXT_CHARS and markers >= 2
+def _body_ok(text: str, *, require_sections: bool = False) -> bool:
+    if len(text) < MIN_FULL_TEXT_CHARS:
+        return False
+    # Preserve TASTE Reading's long-body signal for PDFs/XML. HTML needs
+    # explicit section structure because conference metadata pages can be long.
+    if len(text) >= 8000 and not require_sections:
+        return True
+    headings = set()
+    heading_pattern = re.compile(
+        r"^\s*(?:\d+(?:\.\d+)*[.)]?\s*)?"
+        r"(abstract|introduction|background|related work|method|methods|"
+        r"materials and methods|experiments?|evaluation|results?|discussion|"
+        r"conclusions?|references)\s*[:.]?\s*$",
+        re.IGNORECASE,
+    )
+    for line in str(text or "").splitlines():
+        match = heading_pattern.match(line[:120])
+        if match:
+            heading = match.group(1).lower()
+            headings.add("method" if heading in {"method", "methods", "materials and methods"} else heading.rstrip("s"))
+    scientific = headings - {"abstract", "reference"}
+    core = scientific - {"introduction", "background", "related work"}
+    return (
+        "introduction" in headings
+        and "reference" in headings
+        and len(core) >= 2
+    ) or (
+        len(text) >= 8000
+        and len(core) >= 2
+        and bool(headings & {"result", "evaluation", "discussion", "conclusion"})
+    )
 
 
 def _pdf_text(path: Path) -> str:
@@ -522,17 +552,47 @@ def _download_pdf(paper: dict[str, Any], target_dir: Path) -> tuple[str, Path | 
     return "", None, attempts
 
 
-def _html_text(url: str) -> tuple[str, dict[str, Any]]:
+def _html_route_allowed(paper: dict[str, Any], url: str) -> tuple[bool, str]:
+    lowered = clean(url).lower()
+    if re.search(r"/(?:poster|abstract)(?:/|[-_.])|openreview\.net/forum", lowered):
+        return False, "conference_or_abstract_page_is_not_full_text"
+    try:
+        channel = channel_for_paper(paper)
+    except KeyError:
+        channel = None
+    if channel is not None and getattr(channel, "kind", "") == "conference":
+        return False, "conference_detail_page_is_not_full_text"
+    if channel is not None and getattr(channel, "id", "") == "arxiv":
+        return False, "arxiv_abstract_page_is_not_full_text"
+    return True, ""
+
+
+def _html_text(paper: dict[str, Any], url: str) -> tuple[str, dict[str, Any]]:
+    allowed, reason = _html_route_allowed(paper, url)
+    if not allowed:
+        return "", {
+            "kind": "same_paper_html",
+            "url": url,
+            "accepted": False,
+            "reason": reason,
+        }
     response = get(url, timeout=30)
     result = {"kind": "same_paper_html", **receipt(response)}
     if not response.ok or "html" not in str(response.headers.get("Content-Type") or "").lower():
         return "", {**result, "accepted": False}
+    allowed, reason = _html_route_allowed(paper, response.url)
+    if not allowed:
+        return "", {**result, "accepted": False, "reason": reason}
     soup = BeautifulSoup(response.text, "html.parser")
     for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
         tag.decompose()
     article = soup.find("article") or soup.find("main") or soup.body
     text = "\n".join(line.strip() for line in (article.get_text("\n") if article else "").splitlines() if line.strip())
-    result.update({"text_chars": len(text), "body_ok": _body_ok(text), "accepted": _body_ok(text)})
+    body_ok = (
+        len(text) >= MIN_HTML_FULL_TEXT_CHARS
+        and _body_ok(text, require_sections=True)
+    )
+    result.update({"text_chars": len(text), "body_ok": body_ok, "accepted": body_ok})
     return text if result["accepted"] else "", result
 
 
@@ -598,7 +658,7 @@ def _acquire_with_bounded_requests(paper: dict[str, Any], work_dir: Path) -> dic
                 })
                 continue
             try:
-                candidate, attempt = _html_text(url)
+                candidate, attempt = _html_text(paper, url)
             except Exception as exc:
                 candidate, attempt = "", {"kind": "same_paper_html", "url": url, "accepted": False, "error_type": type(exc).__name__, "message": str(exc)[:500]}
             html_attempts.append(attempt)
@@ -757,11 +817,79 @@ def _cache_aliases(paper: dict[str, Any]) -> list[str]:
 
 
 def _alias_path(alias: str) -> Path:
+    match = re.match(r"^channel:([a-z0-9._-]+)\|", alias)
+    if not match:
+        raise ValueError("Full-text alias is missing its channel namespace")
+    channel = match.group(1)
     digest = stable_hash({"alias": alias})
-    return FULLTEXT_CACHE_ROOT / "_aliases" / digest[:2] / f"{digest}.json"
+    return FULLTEXT_CACHE_ROOT / channel / ".aliases" / digest[:2] / f"{digest}.json"
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def _payload_files_valid(
+    paper: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    allowed_roots: list[Path],
+) -> bool:
+    if (
+        payload.get("schema_version") != ACQUISITION_SCHEMA_VERSION
+        or payload.get("full_text_available") is not True
+        or clean(payload.get("identity")) != paper_identity(paper)
+    ):
+        return False
+    text_path = Path(clean(payload.get("text_path"))).expanduser()
+    if (
+        not text_path.is_file()
+        or not any(_is_within(text_path, root) for root in allowed_roots)
+        or text_path.stat().st_size < MIN_FULL_TEXT_CHARS
+    ):
+        return False
+    try:
+        text = text_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    if not _body_ok(
+        text,
+        require_sections=clean(payload.get("text_kind")).lower() == "html",
+    ) or not _identity_ok(paper, text):
+        return False
+    expected_text_hash = clean(payload.get("text_sha256"))
+    if not expected_text_hash or _file_sha256(text_path) != expected_text_hash:
+        return False
+    pdf_value = clean(payload.get("pdf_path"))
+    if pdf_value:
+        pdf_path = Path(pdf_value).expanduser()
+        expected_pdf_hash = clean(payload.get("pdf_sha256"))
+        if (
+            not pdf_path.is_file()
+            or not any(_is_within(pdf_path, root) for root in allowed_roots)
+            or not expected_pdf_hash
+            or _file_sha256(pdf_path) != expected_pdf_hash
+        ):
+            return False
+    return True
 
 
 def _cached_from_directory(paper: dict[str, Any], directory: Path) -> dict[str, Any] | None:
+    channel_root = FULLTEXT_CACHE_ROOT / _cache_channel(paper)
+    if directory.resolve(strict=False).parent != channel_root.resolve(strict=False):
+        return None
     manifest = directory / "acquisition.json"
     payload = read_json(manifest, {})
     if not isinstance(payload, dict) or payload.get("schema_version") != ACQUISITION_SCHEMA_VERSION or payload.get("full_text_available") is not True:
@@ -776,8 +904,7 @@ def _cached_from_directory(paper: dict[str, Any], directory: Path) -> dict[str, 
             return None
     if not wanted_aliases & cached_aliases:
         return None
-    text_path = Path(str(payload.get("text_path") or "")).expanduser()
-    if not text_path.is_file() or text_path.stat().st_size < MIN_FULL_TEXT_CHARS:
+    if not _payload_files_valid(paper, payload, allowed_roots=[directory]):
         return None
     payload["cache_status"] = "hit"
     return payload
@@ -790,7 +917,13 @@ def cached(paper: dict[str, Any]) -> dict[str, Any] | None:
     for alias in _cache_aliases(paper):
         mapping = read_json(_alias_path(alias), {})
         cache_dir = Path(clean(mapping.get("cache_dir"))).expanduser() if isinstance(mapping, dict) else Path()
-        if str(cache_dir) != ".":
+        channel_root = FULLTEXT_CACHE_ROOT / _cache_channel(paper)
+        if (
+            isinstance(mapping, dict)
+            and clean(mapping.get("alias")) == alias
+            and str(cache_dir) != "."
+            and cache_dir.resolve(strict=False).parent == channel_root.resolve(strict=False)
+        ):
             hit = _cached_from_directory(paper, cache_dir)
             if hit:
                 hit["cache_alias"] = alias
@@ -804,9 +937,13 @@ def _rewrite_root(value: Any, source: Path, destination: Path) -> Any:
     if isinstance(value, list):
         return [_rewrite_root(item, source, destination) for item in value]
     if isinstance(value, str):
-        old = str(source.resolve(strict=False))
-        if value == old or value.startswith(old + os.sep):
-            return str(destination.resolve(strict=False)) + value[len(old):]
+        if os.path.isabs(value):
+            candidate = Path(value).expanduser().resolve(strict=False)
+            try:
+                relative = candidate.relative_to(source.resolve(strict=False))
+                return str(destination.resolve(strict=False) / relative)
+            except ValueError:
+                pass
     return value
 
 
@@ -814,28 +951,45 @@ def publish_cache(paper: dict[str, Any], work_dir: Path, result: dict[str, Any])
     if result.get("full_text_available") is not True:
         return result
     destination = safe_write_target(cache_directory(paper))
+    lock_path = safe_write_target(
+        DATA_ROOT / "state" / "fulltext-publish-locks"
+        / _cache_channel(paper) / f"{destination.name}.lock"
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     with _cache_publish_lock:
-        existing = cached(paper)
-        if existing:
-            return existing
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = Path(tempfile.mkdtemp(prefix=destination.name + ".", dir=destination.parent))
-        try:
-            for child in work_dir.iterdir():
-                target = temporary / child.name
-                shutil.copytree(child, target) if child.is_dir() else shutil.copy2(child, target)
-            cached_result = _rewrite_root(result, work_dir, destination)
-            write_json(temporary / "acquisition.json", cached_result)
-            if destination.exists():
-                shutil.rmtree(destination)
-            os.replace(temporary, destination)
-            for alias in _cache_aliases(paper):
-                write_json(_alias_path(alias), {"alias": alias, "cache_dir": str(destination), "updated_at": now_iso()})
-            cached_result["cache_status"] = "miss_published"
-            return cached_result
-        finally:
-            if temporary.exists():
-                shutil.rmtree(temporary)
+        with FileLock(str(lock_path)):
+            existing = cached(paper)
+            if existing:
+                return existing
+            source_text = Path(clean(result.get("text_path"))).expanduser()
+            if not source_text.is_file():
+                raise RuntimeError("Validated full text disappeared before cache publication")
+            result = {**result, "text_sha256": _file_sha256(source_text)}
+            source_pdf = Path(clean(result.get("pdf_path"))).expanduser()
+            if clean(result.get("pdf_path")) and source_pdf.is_file():
+                result["pdf_sha256"] = _file_sha256(source_pdf)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = Path(tempfile.mkdtemp(prefix=destination.name + ".", dir=destination.parent))
+            try:
+                for child in work_dir.iterdir():
+                    target = temporary / child.name
+                    shutil.copytree(child, target) if child.is_dir() else shutil.copy2(child, target)
+                cached_result = _rewrite_root(result, work_dir, destination)
+                write_json(temporary / "acquisition.json", cached_result)
+                if destination.exists():
+                    shutil.rmtree(destination)
+                os.replace(temporary, destination)
+                for alias in _cache_aliases(paper):
+                    write_json(_alias_path(alias), {
+                        "alias": alias,
+                        "cache_dir": str(destination),
+                        "updated_at": now_iso(),
+                    })
+                cached_result["cache_status"] = "miss_published"
+                return cached_result
+            finally:
+                if temporary.exists():
+                    shutil.rmtree(temporary)
 
 
 def acquire_many(papers: list[dict[str, Any]], run_dir: Path, workers: int) -> dict[str, Any]:
@@ -850,7 +1004,17 @@ def acquire_many(papers: list[dict[str, Any]], run_dir: Path, workers: int) -> d
         paper_dir = input_dir / f"{index:04d}"
         receipt_path = paper_dir / "acquisition.json"
         prior = read_json(receipt_path, {})
-        if isinstance(prior, dict) and prior.get("schema_version") == ACQUISITION_SCHEMA_VERSION and prior.get("identity") == identity and prior.get("full_text_available") is True:
+        if (
+            isinstance(prior, dict)
+            and _payload_files_valid(
+                paper,
+                prior,
+                allowed_roots=[
+                    paper_dir,
+                    FULLTEXT_CACHE_ROOT / _cache_channel(paper),
+                ],
+            )
+        ):
             prior["index"] = index
             prior["cache_status"] = "run_resume"
             return prior

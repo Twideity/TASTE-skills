@@ -17,6 +17,27 @@ ALIASES = {
     "webconf": "www",
 }
 ALL_IDS = (*CONFERENCE_IDS, "arxiv", "biorxiv")
+DISPLAY_NAMES = {
+    "neurips": "NeurIPS",
+    "iclr": "ICLR",
+    "icml": "ICML",
+    "kdd": "KDD",
+    "sigir": "SIGIR",
+    "cikm": "CIKM",
+    "aaai": "AAAI",
+    "iccv": "ICCV",
+    "www": "WWW",
+    "cvpr": "CVPR",
+    "acl": "ACL",
+    "ijcai": "IJCAI",
+    "eccv": "ECCV",
+    "emnlp": "EMNLP",
+}
+DISPLAY_ALIASES = {
+    "neurips": ["NIPS"],
+    "kdd": ["SIGKDD"],
+    "www": ["The Web Conference", "WebConf"],
+}
 
 
 def canonical(value: Any) -> str:
@@ -30,6 +51,23 @@ def get_channel(channel_id: str):
         raise KeyError(f"Unsupported channel: {channel_id}")
     module = importlib.import_module(f"{__package__}.{channel_id}")
     return getattr(module, "CHANNEL", module)
+
+
+def catalog_entries() -> list[dict[str, Any]]:
+    entries = []
+    for channel_id in CONFERENCE_IDS:
+        channel = get_channel(channel_id)
+        entries.append({
+            "id": channel.id,
+            "name": DISPLAY_NAMES[channel_id],
+            "aliases": DISPLAY_ALIASES.get(channel_id, []),
+            "official_source": channel.official_source,
+            "metadata_schema": channel.metadata_schema,
+            "metadata_workers": channel.metadata_workers,
+            "pdf_workers": channel.pdf_workers,
+            "require_complete_abstracts": True,
+        })
+    return entries
 
 
 def channel_for_spec(spec: dict[str, Any]):

@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import re
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from bs4 import BeautifulSoup
 
 from .base import Channel
 from .conference_common import complete_abstract_catalog
-from .runtime import clean, finish
+from .runtime import checkpointed_details, clean, finish, worker_count
 from .shared import acl_pdf_abstract, explicit_pdf, values_blob
 from ..http import get, receipt
 
@@ -34,6 +33,7 @@ def fetch_metadata(spec):
     requests = []
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
+    discovered_count = 0
     for source_url, wanted_volume in (
         (f"https://raw.githubusercontent.com/acl-org/acl-anthology/master/data/xml/{year}.emnlp.xml", ""),
         (f"https://raw.githubusercontent.com/acl-org/acl-anthology/master/data/xml/{year}.findings.xml", "emnlp"),
@@ -48,6 +48,7 @@ def fetch_metadata(spec):
             if wanted_volume and clean(volume.get("id")).lower() != wanted_volume:
                 continue
             for node in volume.findall("paper"):
+                discovered_count += 1
                 title_node = node.find("title")
                 title = clean("".join(title_node.itertext()) if title_node is not None else "")
                 if not title:
@@ -66,9 +67,14 @@ def fetch_metadata(spec):
                 abstract = clean("".join(abstract_node.itertext()) if abstract_node is not None else "")
                 rows.append({"title": title, "abstract": abstract, "authors": authors, "published": f"{year}-01-01", "year": year, "url": paper_url, "pdf_url": paper_url.rstrip("/") + ".pdf", "venue": "EMNLP", "categories": [], "identifiers": {"doi": clean(node.findtext("doi")), "acl_anthology_id": anthology_id}, "metadata": {"official_xml": source_url}})
     missing = [row for row in rows if not clean(row.get("abstract"))]
-    with ThreadPoolExecutor(max_workers=max(1, min(8, len(missing)))) as pool:
-        list(pool.map(_detail, missing))
-    return finish(spec, rows, adapter="acl_anthology", requests=requests, proof="official_acl_anthology_xml_exhausted_and_all_abstracts_present", discovered_count=len(rows))
+    checkpointed_details(
+        spec,
+        missing,
+        adapter="acl_anthology",
+        enrich=_detail,
+        workers=worker_count(spec, 8),
+    )
+    return finish(spec, rows, adapter="acl_anthology", requests=requests, proof="official_acl_anthology_xml_exhausted_and_all_abstracts_present", discovered_count=discovered_count)
 
 
 def pdf_candidates(paper: dict[str, Any]):

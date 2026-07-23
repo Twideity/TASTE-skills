@@ -1,6 +1,5 @@
 from __future__ import annotations
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 from urllib.parse import urljoin
 
@@ -8,9 +7,9 @@ from bs4 import BeautifulSoup
 
 from .base import Channel
 from .conference_common import complete_abstract_catalog
-from .runtime import clean, finish, looks_like_title, response
+from .runtime import AuthoritativeEmptyCatalog, checkpointed_details, clean, finish, looks_like_title, response, worker_count
 from .shared import explicit_pdf, values_blob
-from ..http import receipt
+from ..http import get, receipt
 
 ID = "neurips"
 SOURCE = "NeurIPS Proceedings"
@@ -54,44 +53,55 @@ def _detail(row: dict[str, Any]) -> dict[str, Any]:
 def fetch_metadata(spec):
     year = int(spec["years"][0])
     list_response = None
+    not_found = 0
     for list_url in (
         f"https://proceedings.neurips.cc/paper_files/paper/{year}",
         f"https://papers.nips.cc/paper_files/paper/{year}",
     ):
         try:
-            list_response = response(list_url, timeout=90)
+            candidate = get(list_url, timeout=90)
+            if candidate.status_code == 404:
+                not_found += 1
+                continue
+            candidate.raise_for_status()
+            list_response = candidate
             break
         except Exception:
             continue
     if list_response is None:
+        if not_found == 2:
+            raise AuthoritativeEmptyCatalog(f"NeurIPS has no published proceedings catalog for {year}")
         raise RuntimeError(f"NeurIPS official proceedings index unavailable for {year}")
     soup = BeautifulSoup(list_response.text, "html.parser")
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
+    discovered: set[str] = set()
     for anchor in soup.find_all("a", href=True):
         href = str(anchor.get("href") or "")
         title = clean(anchor.get_text(" ", strip=True))
-        if not looks_like_title(title) or "-Abstract-" not in href or not href.endswith(".html"):
+        if "-Abstract-" not in href or not href.endswith(".html"):
             continue
         detail_url = urljoin(list_response.url, href)
-        if detail_url in seen:
+        if detail_url in discovered:
+            continue
+        discovered.add(detail_url)
+        if not looks_like_title(title):
             continue
         seen.add(detail_url)
         rows.append({"title": title, "abstract": "", "authors": [], "published": f"{year}-01-01", "year": year, "url": detail_url, "pdf_url": "", "venue": "NeurIPS", "categories": [], "identifiers": {}, "metadata": {"official_index": list_response.url}})
-    workers = 16
-    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(rows)))) as pool:
-        futures = {pool.submit(_detail, row): row for row in rows}
-        for future in as_completed(futures):
-            row = futures[future]
-            try:
-                future.result()
-            except Exception as exc:
-                row.setdefault("metadata", {})["detail_error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+    workers = worker_count(spec, 8)
+    checkpointed_details(
+        spec,
+        rows,
+        adapter="neurips_official_papers",
+        enrich=_detail,
+        workers=workers,
+    )
     result, details = finish(
         spec, rows, adapter="neurips_official_papers",
         requests=[receipt(list_response)],
         proof="official_neurips_proceedings_index_exhausted_and_all_details_enriched",
-        discovered_count=len(rows),
+        discovered_count=len(discovered),
     )
     details["detail_parser"] = "taste_neurips_marker_parser"
     details["detail_workers"] = workers

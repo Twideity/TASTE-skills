@@ -82,7 +82,6 @@
     "selection_basis": "highest_expected_value_for_research_topic"
   },
   "metadata_cache_max_age_days": 7,
-  "nonvenue_fetch_limit_per_source": 5000,
   "retrieval_windows": {
     "conference": {
       "mode": "latest_available_metadata_year",

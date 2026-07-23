@@ -1,12 +1,11 @@
 from __future__ import annotations
 import re
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from .base import Channel
 from .conference_common import complete_abstract_catalog
-from .runtime import clean, finish, looks_like_title, response
+from .runtime import catalog_response, checkpointed_details, clean, finish, looks_like_title, response, worker_count
 from .shared import explicit_pdf, values_blob
 from ..http import receipt
 ID = "iccv"; SOURCE = "CVF Open Access"
@@ -18,10 +17,12 @@ def _detail(row):
 
 def fetch_metadata(spec):
     year=int(spec["years"][0]); list_url=f"https://openaccess.thecvf.com/ICCV{year}?day=all"
-    r=response(list_url); s=BeautifulSoup(r.text,"html.parser"); rows=[]; seen=set()
+    r=catalog_response(list_url,label="ICCV",year=year); s=BeautifulSoup(r.text,"html.parser"); rows=[]; seen=set(); discovered=set()
     for node in s.select("dt.ptitle a[href], dt a[href]"):
         title=clean(node.get_text(" ",strip=True)); url=urljoin(list_url,str(node.get("href") or ""))
-        if not looks_like_title(title) or url in seen: continue
+        if url in discovered: continue
+        discovered.add(url)
+        if not looks_like_title(title): continue
         seen.add(url); parent=node.find_parent("dt"); authors=[]; pdf=""
         for sibling in parent.find_next_siblings(["dd","dt"]) if parent else []:
             if sibling.name=="dt": break
@@ -29,8 +30,8 @@ def fetch_metadata(spec):
             link=sibling.find("a",href=re.compile(r"\.pdf(?:$|[?#])",re.I))
             if link: pdf=urljoin(list_url,str(link.get("href"))); break
         rows.append({"title":title,"abstract":"","authors":authors,"published":f"{year}-01-01","year":year,"url":url,"pdf_url":pdf,"venue":"ICCV","categories":[],"identifiers":{},"metadata":{"official_index":list_url}})
-    with ThreadPoolExecutor(max_workers=max(1,min(8,len(rows)))) as pool: list(pool.map(_detail,rows))
-    return finish(spec,rows,adapter="cvf_openaccess",requests=[receipt(r)],proof="official_cvf_index_exhausted_and_all_details_enriched",discovered_count=len(rows))
+    checkpointed_details(spec,rows,adapter="cvf_openaccess",enrich=_detail,workers=worker_count(spec,8))
+    return finish(spec,rows,adapter="cvf_openaccess",requests=[receipt(r)],proof="official_cvf_index_exhausted_and_all_details_enriched",discovered_count=len(discovered))
 
 def pdf_candidates(paper: dict[str,Any]):
     rows=explicit_pdf(paper,"iccv_cvf_pdf",SOURCE)

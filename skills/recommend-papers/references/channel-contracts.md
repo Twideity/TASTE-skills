@@ -24,15 +24,19 @@ shared body and paper-identity validation before publication.
 | arXiv | Exhaustive category/date Atom pagination partitioned into closed-day shards | arXiv official PDF | `metadata/arxiv/<category>/<day>.json` |
 | bioRxiv | Exhaustive cursor pagination partitioned into daily shards with version reconciliation | bioRxiv DOI/version PDF | `metadata/biorxiv/<day>.json` |
 
-Conference caches are accepted only when their channel/schema/year match,
-catalog exhaustion is proven, and every record has a real abstract. arXiv and
-bioRxiv caches additionally distinguish immutable closed days from provisional
-current-day shards. Full-text caches are channel-qualified and
-acquisition-contract-versioned under `fulltext/<channel>/<identity-hash>/`.
+Conference caches are accepted only when payload/source/cache-key,
+channel/schema/year, receipt counts, unique identities, row venues and any
+minimum catalog size all match; catalog exhaustion and a real abstract for
+every record remain mandatory. arXiv and bioRxiv shards bind their source,
+date/category, identifiers and full abstracts, and distinguish immutable
+closed days from provisional current-day shards. Full-text caches are
+channel-qualified, hashed and acquisition-contract-versioned under
+`fulltext/<channel>/<identity-hash>/`.
 
 Source concurrency is channel-owned. Independent channels may run together;
 OpenReview shares one process-safe slot by default with a hard ceiling of three,
 ACM-family metadata is challenge-aware and serial at the service gate, and
 arXiv uses one spaced slot. `Retry-After`, cross-process cooldowns, bounded
-optional fallbacks, and resumable staging/checkpoints apply to production
-requests themselves.
+optional fallbacks, and resumable production staging/checkpoints apply to
+requests themselves. These checkpoints are runtime state, never an alternate
+availability-only or sampled acquisition path.

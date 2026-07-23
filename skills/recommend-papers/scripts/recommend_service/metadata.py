@@ -10,13 +10,21 @@ import xml.etree.ElementTree as ET
 import calendar
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
-
-from bs4 import BeautifulSoup
+from typing import Any
 
 from .http import get, receipt
-from .storage import DATA_ROOT, METADATA_CACHE_ROOT, now_iso, read_json, stable_hash, write_json
+from .storage import (
+    DATA_ROOT,
+    FULLTEXT_CACHE_ROOT,
+    METADATA_CACHE_ROOT,
+    now_iso,
+    read_json,
+    stable_hash,
+    write_json,
+)
 from .channels import channel_for_spec
+from .channels.registry import canonical, catalog_entries
+from .channels.runtime import abstract_is_real, clean_abstract
 
 
 ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
@@ -24,22 +32,6 @@ OPENSEARCH_NS = "http://a9.com/-/spec/opensearch/1.1/"
 DEFAULT_ARXIV_AI_CATEGORIES = ("cs.AI", "cs.LG", "stat.ML", "cs.CL", "cs.CV", "cs.IR", "cs.RO", "eess.SY", "cs.MA", "cs.NE")
 BIORXIV_RECHECK_DAYS = 3
 BIORXIV_RECHECK_MAX_AGE_DAYS = 1.0
-DEFAULT_VENUES = [
-    {"id": "neurips", "name": "NeurIPS", "aliases": ["NIPS"], "adapter": "neurips_official", "fallback_adapters": ["openreview"], "query": "NeurIPS", "openreview_venue_id_template": "NeurIPS.cc/{year}/Conference", "require_complete_abstracts": True, "require_official_categories": False, "dblp_volume_template": "https://dblp.org/db/conf/nips/neurips{year}.xml"},
-    {"id": "iclr", "name": "ICLR", "aliases": [], "adapter": "openreview", "query": "ICLR", "openreview_venue_id_template": "ICLR.cc/{year}/Conference", "require_complete_abstracts": True, "require_official_categories": True},
-    {"id": "icml", "name": "ICML", "aliases": [], "adapter": "openreview", "fallback_adapters": ["icml_official"], "query": "ICML", "openreview_venue_id_template": "ICML.cc/{year}/Conference", "require_complete_abstracts": True, "require_official_categories": True, "dblp_volume_template": "https://dblp.org/db/conf/icml/icml{year}.xml"},
-    {"id": "kdd", "name": "KDD", "aliases": ["SIGKDD"], "adapter": "acm_enriched", "query": "KDD", "require_complete_abstracts": True},
-    {"id": "sigir", "name": "SIGIR", "aliases": [], "adapter": "acm_enriched", "query": "SIGIR", "require_complete_abstracts": True},
-    {"id": "cikm", "name": "CIKM", "aliases": [], "adapter": "acm_enriched", "query": "CIKM", "require_complete_abstracts": True},
-    {"id": "www", "name": "WWW", "aliases": ["The Web Conference", "WebConf"], "adapter": "acm_enriched", "query": "WWW", "require_complete_abstracts": True},
-    {"id": "aaai", "name": "AAAI", "aliases": [], "adapter": "aaai_ojs", "query": "AAAI", "require_complete_abstracts": True},
-    {"id": "iccv", "name": "ICCV", "aliases": [], "adapter": "cvf_openaccess", "query": "ICCV", "require_complete_abstracts": True},
-    {"id": "cvpr", "name": "CVPR", "aliases": [], "adapter": "cvf_openaccess", "query": "CVPR", "require_complete_abstracts": True},
-    {"id": "acl", "name": "ACL", "aliases": [], "adapter": "acl_anthology", "query": "ACL", "require_complete_abstracts": True},
-    {"id": "ijcai", "name": "IJCAI", "aliases": [], "adapter": "ijcai_proceedings", "query": "IJCAI", "require_complete_abstracts": True},
-    {"id": "eccv", "name": "ECCV", "aliases": [], "adapter": "eccv_virtual", "fallback_adapters": ["openreview"], "openreview_venue_id_template": "thecvf.com/ECCV/{year}/Conference", "openreview_venue_value_template": "ECCV {year}", "query": "ECCV", "require_complete_abstracts": True},
-    {"id": "emnlp", "name": "EMNLP", "aliases": [], "adapter": "acl_anthology", "query": "EMNLP", "require_complete_abstracts": True},
-]
 
 
 def clean(value: Any) -> str:
@@ -70,7 +62,7 @@ def paper_identity(paper: dict[str, Any]) -> str:
 def normalize(paper: dict[str, Any], source_type: str) -> dict[str, Any]:
     row = dict(paper)
     row["title"] = clean(row.get("title"))
-    row["abstract"] = clean(row.get("abstract"))
+    row["abstract"] = clean_abstract(row.get("abstract"))
     authors = row.get("authors")
     if isinstance(authors, str):
         authors = re.split(r"\s*(?:,|;|\band\b)\s*", authors)
@@ -137,6 +129,85 @@ def _arxiv_entry(entry: ET.Element) -> dict[str, Any]:
     }
 
 
+class _ArxivRangeTooLarge(RuntimeError):
+    def __init__(self, total: int):
+        super().__init__(f"arXiv range exposes {total} records")
+        self.total = total
+
+
+def _assert_complete_preprint_rows(
+    rows: list[dict[str, Any]],
+    *,
+    source: str,
+    expected_day: str | None = None,
+    expected_category: str | None = None,
+) -> None:
+    invalid = []
+    identities = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            invalid.append(f"<invalid-row-{index}>")
+            identities.append(f"<invalid-row-{index}>")
+            continue
+        categories = row.get("categories") if isinstance(row.get("categories"), list) else []
+        identifiers = row.get("identifiers") if isinstance(row.get("identifiers"), dict) else {}
+        if source == "arxiv":
+            identifier = clean(identifiers.get("arxiv_id")).lower()
+        else:
+            doi = clean(identifiers.get("doi")).lower()
+            version = clean(identifiers.get("biorxiv_version") or row.get("version"))
+            identifier = f"{doi}v{version}" if doi else ""
+        identities.append(identifier)
+        if (
+            not clean(row.get("title"))
+            or not abstract_is_real(row.get("abstract"))
+            or not row.get("authors")
+            or not identifier
+            or (expected_day and date_text(row.get("published")) != expected_day)
+            or (expected_category and expected_category not in categories)
+        ):
+            invalid.append(clean(row.get("title")) or "<untitled>")
+    duplicate_count = len(identities) - len(set(identities))
+    if invalid or duplicate_count:
+        raise RuntimeError(
+            f"{source} metadata is incomplete: invalid_records={len(invalid)}, "
+            f"duplicate_records={duplicate_count}, examples={invalid[:5]}"
+        )
+
+
+def _preprint_shard_valid(
+    payload: Any,
+    *,
+    source: str,
+    day: str,
+    category: str | None = None,
+) -> bool:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 2
+        or clean(payload.get("source")).lower() != source
+        or clean(payload.get("date")) != day
+        or not isinstance(payload.get("papers"), list)
+    ):
+        return False
+    try:
+        _assert_complete_preprint_rows(
+            payload["papers"],
+            source=source,
+            expected_day=day,
+            expected_category=category,
+        )
+    except RuntimeError:
+        return False
+    if source == "biorxiv":
+        try:
+            if int(payload.get("server_total") or 0) != len(payload["papers"]):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 def _fetch_arxiv_category_range(category: str, start_date: str, end_date: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     search_query = f"cat:{category} AND submittedDate:[{start_date.replace('-', '')}0000 TO {end_date.replace('-', '')}2359]"
     rows: list[dict[str, Any]] = []
@@ -150,9 +221,12 @@ def _fetch_arxiv_category_range(category: str, start_date: str, end_date: str) -
         if isinstance(staged, dict) and staged.get("schema_version") == 1 and staged.get("query") == search_query and staged.get("offset") == offset and isinstance(staged.get("papers"), list):
             page_rows = staged["papers"]
             staged_total = int(staged.get("server_total") or 0)
+            if staged_total >= 10000:
+                raise _ArxivRangeTooLarge(staged_total)
             if total is not None and total != staged_total:
                 raise RuntimeError(f"arXiv staged page total changed for {category} {start_date}..{end_date}")
             total = staged_total
+            _assert_complete_preprint_rows(page_rows, source="arxiv", expected_category=category)
             rows.extend(page_rows)
             receipts.append({"status": "staging_cache_hit", "offset": offset, "count": len(page_rows), "stage_path": str(stage_path)})
             offset += len(page_rows)
@@ -171,11 +245,14 @@ def _fetch_arxiv_category_range(category: str, start_date: str, end_date: str) -
         root = ET.fromstring(response.text)
         total_text = root.findtext(f"{{{OPENSEARCH_NS}}}totalResults")
         page_total = int(total_text or 0)
+        if page_total >= 10000:
+            raise _ArxivRangeTooLarge(page_total)
         if total is not None and total != page_total:
             raise RuntimeError(f"arXiv totalResults changed during pagination for {category} {start_date}..{end_date}: {total} -> {page_total}")
         total = page_total
         entries = root.findall("atom:entry", ARXIV_NS)
         page_rows = [_arxiv_entry(entry) for entry in entries]
+        _assert_complete_preprint_rows(page_rows, source="arxiv", expected_category=category)
         write_json(stage_path, {"schema_version": 1, "query": search_query, "category": category, "start_date": start_date, "end_date": end_date, "offset": offset, "server_total": total, "papers": page_rows, "fetched_at": now_iso()})
         rows.extend(page_rows)
         offset += len(page_rows)
@@ -183,11 +260,41 @@ def _fetch_arxiv_category_range(category: str, start_date: str, end_date: str) -
             break
     if total is None or len(rows) != total:
         raise RuntimeError(f"arXiv exhaustive pagination failed for {category}: expected={total}, fetched={len(rows)}")
-    return rows, {"status": "complete", "category": category, "query": search_query, "server_total": total, "fetched": len(rows), "exhausted": True, "truncated": False, "exhaustion_proof": "opensearch_total_results_reached", "requests": receipts}
+    return rows, {
+        "status": "complete",
+        "category": category,
+        "query": search_query,
+        "range_start": start_date,
+        "range_end": end_date,
+        "server_total": total,
+        "fetched": len(rows),
+        "exhausted": True,
+        "truncated": False,
+        "exhaustion_proof": "opensearch_total_results_reached",
+        "requests": receipts,
+    }
 
 
-def fetch_arxiv(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    raise RuntimeError("Use fetch_arxiv_cached so category/day completeness can be persisted and verified")
+def _fetch_arxiv_safe_ranges(
+    category: str, days: list[str]
+) -> list[tuple[list[dict[str, Any]], dict[str, Any]]]:
+    start_date, end_date = min(days), max(days)
+    try:
+        return [_fetch_arxiv_category_range(category, start_date, end_date)]
+    except _ArxivRangeTooLarge as exc:
+        stage_dir = _arxiv_page_stage_path(category, start_date, end_date, 0).parent
+        if stage_dir.is_dir():
+            shutil.rmtree(stage_dir)
+        if len(days) == 1:
+            raise RuntimeError(
+                f"arXiv single-day shard is too large for safe exhaustive pagination: "
+                f"{category} {days[0]} total={exc.total}"
+            ) from exc
+        midpoint = len(days) // 2
+        return (
+            _fetch_arxiv_safe_ranges(category, days[:midpoint])
+            + _fetch_arxiv_safe_ranges(category, days[midpoint:])
+        )
 
 
 def fetch_arxiv_cached(spec: dict[str, Any], *, policy: str, max_age_days: float) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -205,7 +312,13 @@ def fetch_arxiv_cached(spec: dict[str, Any], *, policy: str, max_age_days: float
         missing = []
         for day in days:
             payload = read_json(_arxiv_day_cache_path(category, day), {})
-            usable = day < today and isinstance(payload, dict) and payload.get("schema_version") == 2 and payload.get("complete") is True and payload.get("provisional") is not True and (policy == "only" or _cache_fresh(payload, max_age_days))
+            usable = (
+                day < today
+                and _preprint_shard_valid(payload, source="arxiv", day=day, category=category)
+                and payload.get("complete") is True
+                and payload.get("provisional") is not True
+                and (policy == "only" or _cache_fresh(payload, max_age_days))
+            )
             if policy == "refresh" or not usable:
                 missing.append(day)
             else:
@@ -215,15 +328,22 @@ def fetch_arxiv_cached(spec: dict[str, Any], *, policy: str, max_age_days: float
                 raise FileNotFoundError(f"Missing usable arXiv day shards for {category}: {len(missing)}")
             chunk_receipts = []
             for chunk_days in _arxiv_month_chunks(missing):
-                fetched, crawl_receipt = _fetch_arxiv_category_range(category, min(chunk_days), max(chunk_days))
-                if int(crawl_receipt.get("server_total") or 0) >= 10000:
-                    raise RuntimeError(f"arXiv monthly shard is too large for safe exhaustive pagination: {category} {chunk_days[0][:7]}")
+                fetched: list[dict[str, Any]] = []
+                safe_ranges = _fetch_arxiv_safe_ranges(category, chunk_days)
+                for range_rows, _ in safe_ranges:
+                    fetched.extend(range_rows)
                 partitioned = {day: [] for day in chunk_days}
                 for row in fetched:
                     published = date_text(row.get("published"))
                     if published in partitioned:
                         partitioned[published].append(normalize(row, "arxiv"))
                 for day in chunk_days:
+                    _assert_complete_preprint_rows(
+                        partitioned[day],
+                        source="arxiv",
+                        expected_day=day,
+                        expected_category=category,
+                    )
                     closed_day = day < today
                     payload = {
                         "schema_version": 2,
@@ -235,16 +355,33 @@ def fetch_arxiv_cached(spec: dict[str, Any], *, policy: str, max_age_days: float
                         "provisional": not closed_day,
                         "temporal_status": "closed_day" if closed_day else "open_current_or_future_day",
                         "papers": partitioned[day],
-                        "range_exhaustion_proof": crawl_receipt["exhaustion_proof"],
+                        "range_exhaustion_proof": "all_safe_subranges_reached_opensearch_total",
                         "range_start": min(chunk_days),
                         "range_end": max(chunk_days),
                     }
                     write_json(_arxiv_day_cache_path(category, day), payload)
                     cached_by_day[day] = payload
-                stage_dir = _arxiv_page_stage_path(category, min(chunk_days), max(chunk_days), 0).parent
-                if stage_dir.is_dir():
-                    shutil.rmtree(stage_dir)
-                chunk_receipts.append({**crawl_receipt, "day_shards_written": len(chunk_days)})
+                for _, crawl_receipt in safe_ranges:
+                    stage_dir = _arxiv_page_stage_path(
+                        category,
+                        crawl_receipt["range_start"],
+                        crawl_receipt["range_end"],
+                        0,
+                    ).parent
+                    if stage_dir.is_dir():
+                        shutil.rmtree(stage_dir)
+                chunk_receipts.append({
+                    "status": "complete",
+                    "category": category,
+                    "server_total": sum(int(item.get("server_total") or 0) for _, item in safe_ranges),
+                    "fetched": len(fetched),
+                    "requests": [request for _, item in safe_ranges for request in item.get("requests") or []],
+                    "exhausted": True,
+                    "truncated": False,
+                    "exhaustion_proof": "all_safe_subranges_reached_opensearch_total",
+                    "subrange_count": len(safe_ranges),
+                    "day_shards_written": len(chunk_days),
+                })
             category_receipts.append({
                 "status": "complete",
                 "category": category,
@@ -346,6 +483,7 @@ def _fetch_biorxiv_range(start_date: str, end_date: str) -> tuple[list[dict[str,
             break
     if server_total is not None and cursor < server_total:
         raise RuntimeError(f"bioRxiv exhaustive pagination failed for {start_date}..{end_date}: expected={server_total}, scanned={cursor}")
+    _assert_complete_preprint_rows(rows, source="biorxiv")
     return rows, {
         "status": "complete",
         "requests": receipts,
@@ -357,14 +495,6 @@ def _fetch_biorxiv_range(start_date: str, end_date: str) -> tuple[list[dict[str,
         "next_cursor": None,
         "exhaustion_proof": "biorxiv_cursor_reached_server_total" if server_total is not None and cursor >= server_total else "biorxiv_empty_final_page",
     }
-
-
-def fetch_biorxiv(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    start_date = date_text(spec.get("start_date"))
-    end_date = date_text(spec.get("end_date"))
-    if not start_date or not end_date:
-        raise ValueError("bioRxiv requires concrete start_date and end_date")
-    return _fetch_biorxiv_range(start_date, end_date)
 
 
 def _biorxiv_latest_versions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -399,7 +529,14 @@ def fetch_biorxiv_cached(spec: dict[str, Any], *, policy: str, max_age_days: flo
     missing: list[str] = []
     for day in days:
         payload = read_json(_biorxiv_day_cache_path(day), {})
-        proven = isinstance(payload, dict) and payload.get("schema_version") == 2 and payload.get("complete") is True and payload.get("provisional") is not True and payload.get("exhausted") is True and payload.get("truncated") is False and bool(payload.get("exhaustion_proof"))
+        proven = (
+            _preprint_shard_valid(payload, source="biorxiv", day=day)
+            and payload.get("complete") is True
+            and payload.get("provisional") is not True
+            and payload.get("exhausted") is True
+            and payload.get("truncated") is False
+            and bool(payload.get("exhaustion_proof"))
+        )
         recent_fresh = day < recent_cutoff or _cache_fresh(payload, min(max_age_days, BIORXIV_RECHECK_MAX_AGE_DAYS))
         usable = day < today and proven and (policy == "only" or recent_fresh)
         if policy == "refresh" or not usable:
@@ -419,6 +556,11 @@ def fetch_biorxiv_cached(spec: dict[str, Any], *, policy: str, max_age_days: flo
                 if published in partitioned:
                     partitioned[published].append(row)
             for day in chunk_days:
+                _assert_complete_preprint_rows(
+                    partitioned[day],
+                    source="biorxiv",
+                    expected_day=day,
+                )
                 closed_day = day < today
                 payload = {
                     "schema_version": 2,
@@ -468,37 +610,32 @@ def fetch_biorxiv_cached(spec: dict[str, Any], *, policy: str, max_age_days: flo
     }
 
 
-def _conference_abstract_is_real(value: Any) -> bool:
-    text = clean(value)
-    if not text:
-        return False
-    lower = text.lower()
-    if lower.startswith("correct abstract if needed. retain xml formatting tags"):
-        return False
-    # ACL Anthology's OpenGraph description is a citation, normally formatted
-    # as "Authors. Proceedings/Findings ... YEAR.".  It was previously
-    # accepted as an abstract, so reject that exact bibliographic shape at
-    # every formal cache boundary as well as fixing the page extractor.
-    if re.search(r"\.\s+(?:proceedings|findings)\s+of\s+the\b.*\b(?:19|20)\d{2}\.?$", text, re.I):
-        return False
-    return True
-
-
 def venue_metadata_audit(rows: list[dict[str, Any]], *, require_official_categories: bool = False) -> dict[str, Any]:
     count = len(rows)
-    identities = [paper_identity(row) for row in rows]
-    unique = len(set(identities))
-    titled = sum(bool(clean(row.get("title"))) for row in rows)
-    authored = sum(bool(row.get("authors")) for row in rows)
-    linked = sum(bool(clean(row.get("url") or row.get("pdf_url"))) for row in rows)
-    invalid_abstracts = [
-        clean(row.get("title"))
-        for row in rows
-        if clean(row.get("abstract")) and not _conference_abstract_is_real(row.get("abstract"))
+    malformed = sum(not isinstance(row, dict) for row in rows)
+    identities = [
+        paper_identity(row) if isinstance(row, dict) else f"malformed:{index}"
+        for index, row in enumerate(rows)
     ]
-    abstracted = sum(_conference_abstract_is_real(row.get("abstract")) for row in rows)
-    categorized = sum(bool(row.get("categories")) for row in rows)
-    complete = bool(count and unique and titled == count and authored / count >= 0.95 and linked / count >= 0.95)
+    unique = len(set(identities))
+    titled = sum(isinstance(row, dict) and bool(clean(row.get("title"))) for row in rows)
+    authored = sum(isinstance(row, dict) and bool(row.get("authors")) for row in rows)
+    linked = sum(isinstance(row, dict) and bool(clean(row.get("url") or row.get("pdf_url"))) for row in rows)
+    invalid_abstracts = [
+        clean(row.get("title")) if isinstance(row, dict) else "<malformed-row>"
+        for row in rows
+        if not isinstance(row, dict) or not abstract_is_real(row.get("abstract"))
+    ]
+    abstracted = sum(isinstance(row, dict) and abstract_is_real(row.get("abstract")) for row in rows)
+    categorized = sum(isinstance(row, dict) and bool(row.get("categories")) for row in rows)
+    complete = bool(
+        count
+        and not malformed
+        and unique == count
+        and titled == count
+        and authored / count >= 0.95
+        and linked / count >= 0.95
+    )
     complete = complete and abstracted == count
     if require_official_categories:
         complete = complete and categorized == count
@@ -506,6 +643,7 @@ def venue_metadata_audit(rows: list[dict[str, Any]], *, require_official_categor
         "record_count": count,
         "unique_identity_count": unique,
         "duplicate_count": count - unique,
+        "malformed_record_count": malformed,
         "title_coverage": round(titled / count, 6) if count else 0.0,
         "author_coverage": round(authored / count, 6) if count else 0.0,
         "link_coverage": round(linked / count, 6) if count else 0.0,
@@ -525,15 +663,92 @@ def _complete_conference_cache(payload: Any, source: dict[str, Any]) -> tuple[bo
         return False, {}
     receipt_data = payload.get("receipt") if isinstance(payload.get("receipt"), dict) else {}
     rows = payload.get("papers") if isinstance(payload.get("papers"), list) else []
-    venue_id = clean(source.get("venue_id") or source.get("venue")).lower()
+    payload_source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    try:
+        venue_id = canonical(source.get("venue_id") or source.get("venue"))
+        requested_years = [int(value) for value in source.get("years") or []]
+        payload_years = [int(value) for value in payload_source.get("years") or []]
+        channel = channel_for_spec(source)
+        minimum = int(source.get("minimum_catalog_records") or 0)
+    except (KeyError, TypeError, ValueError) as exc:
+        return False, {
+            "metadata_completeness_ok": False,
+            "reason": "invalid_cache_contract",
+            "error_type": type(exc).__name__,
+        }
+    expected_year = requested_years[0] if len(requested_years) == 1 else 0
+    row_years = []
+    row_venues = []
+    for row in rows:
+        if not isinstance(row, dict):
+            row_years.append(0)
+            row_venues.append("")
+            continue
+        try:
+            row_years.append(int(row.get("year") or date_text(row.get("published"))[:4] or 0))
+        except (TypeError, ValueError):
+            row_years.append(0)
+        row_venues.append(canonical(row.get("venue")))
+    source_binding_ok = (
+        clean(payload_source.get("type")).lower() == "venue"
+        and canonical(payload_source.get("venue_id") or payload_source.get("venue")) == venue_id
+        and payload_years == requested_years
+    )
+    cache_key_ok = (
+        bool(payload_source)
+        and clean(payload.get("cache_key")) == stable_hash(payload_source)
+    )
+    try:
+        payload_schema = int(payload.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        payload_schema = 0
+    payload_binding_ok = (
+        clean(payload.get("channel")) == channel.id
+        and payload_schema == channel.metadata_schema
+    )
+    row_binding_ok = bool(
+        rows
+        and all(year == expected_year for year in row_years)
+        and all(value == venue_id for value in row_venues)
+        and all(
+            isinstance(row, dict)
+            and clean(row.get("source_type")).lower() == "venue"
+            for row in rows
+        )
+    )
+    receipt_binding_ok = (
+        receipt_data.get("count") == len(rows)
+        and receipt_data.get("discovered_count") == len(rows)
+        and receipt_data.get("requested_years") == requested_years
+        and receipt_data.get("effective_years") == requested_years
+        and canonical(receipt_data.get("channel")) == venue_id
+    )
     audit = venue_metadata_audit(
         rows,
-        require_official_categories=venue_id in {"iclr", "icml"},
+        require_official_categories=source.get("require_official_categories") is True,
     )
+    audit.update({
+        "requested_year": expected_year,
+        "wrong_year_count": sum(year != expected_year for year in row_years),
+        "wrong_venue_count": sum(value != venue_id for value in row_venues),
+        "source_binding_ok": source_binding_ok,
+        "cache_key_ok": cache_key_ok,
+        "payload_binding_ok": payload_binding_ok,
+        "row_binding_ok": row_binding_ok,
+        "receipt_binding_ok": receipt_binding_ok,
+        "minimum_catalog_records": minimum or None,
+        "minimum_catalog_records_ok": not minimum or len(rows) >= minimum,
+    })
     complete = (
         receipt_data.get("status") == "complete"
         and receipt_data.get("complete_catalog") is True
         and bool(receipt_data.get("exhaustion_proof"))
+        and source_binding_ok
+        and cache_key_ok
+        and payload_binding_ok
+        and row_binding_ok
+        and receipt_binding_ok
+        and (not minimum or len(rows) >= minimum)
         and audit["metadata_completeness_ok"]
     )
     # Older caches could mark a smaller OpenReview subset as the complete
@@ -547,84 +762,7 @@ def _complete_conference_cache(payload: Any, source: dict[str, Any]) -> tuple[bo
     return complete, audit
 
 
-def _crossref_date(item: dict[str, Any]) -> str:
-    for key in ("published-print", "published-online", "issued", "created"):
-        value = item.get(key)
-        parts = (value or {}).get("date-parts") if isinstance(value, dict) else None
-        if isinstance(parts, list) and parts and isinstance(parts[0], list) and parts[0]:
-            values = list(parts[0]) + [1, 1]
-            try:
-                return date(int(values[0]), int(values[1]), int(values[2])).isoformat()
-            except ValueError:
-                continue
-    return ""
-
-
-def fetch_crossref(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    limit = max(1, int(spec.get("limit") or 5000))
-    start_date = date_text(spec.get("start_date"))
-    end_date = date_text(spec.get("end_date"))
-    queries = [clean(item) for item in spec.get("queries") or [] if clean(item)] or [""]
-    journals = [clean(item) for item in spec.get("journals") or [] if clean(item)]
-    rows = []
-    receipts = []
-    for query in queries:
-        cursor = "*"
-        while len(rows) < limit:
-            filters = ["type:journal-article"]
-            if start_date:
-                filters.append(f"from-pub-date:{start_date}")
-            if end_date:
-                filters.append(f"until-pub-date:{end_date}")
-            params = {"filter": ",".join(filters), "rows": min(1000, limit - len(rows)), "cursor": cursor}
-            if query:
-                params["query.bibliographic"] = query
-            response = get("https://api.crossref.org/works", params=params)
-            receipts.append(receipt(response))
-            response.raise_for_status()
-            message = response.json().get("message") or {}
-            items = message.get("items") or []
-            if not items:
-                break
-            for item in items:
-                containers = item.get("container-title") or []
-                container = clean(containers[0] if containers else "")
-                if journals and not any(name.lower() in container.lower() for name in journals):
-                    continue
-                title_values = item.get("title") or []
-                abstract = BeautifulSoup(str(item.get("abstract") or ""), "html.parser").get_text(" ")
-                doi = clean(item.get("DOI"))
-                links = item.get("link") or []
-                pdf_url = next((clean(link.get("URL")) for link in links if "pdf" in clean(link.get("content-type")).lower()), "")
-                rows.append({
-                    "title": title_values[0] if title_values else "",
-                    "abstract": abstract,
-                    "authors": [" ".join(filter(None, [clean(author.get("given")), clean(author.get("family"))])) for author in item.get("author") or []],
-                    "published": _crossref_date(item),
-                    "url": clean(item.get("URL")) or (f"https://doi.org/{doi}" if doi else ""),
-                    "pdf_url": pdf_url,
-                    "venue": container,
-                    "identifiers": {"doi": doi},
-                })
-                if len(rows) >= limit:
-                    break
-            next_cursor = clean(message.get("next-cursor"))
-            if not next_cursor or next_cursor == cursor or len(items) < int(params["rows"]):
-                break
-            cursor = next_cursor
-        if len(rows) >= limit:
-            break
-    return rows[:limit], {"status": "complete", "requests": receipts, "count": len(rows[:limit])}
-
-
-FETCHERS: dict[str, Callable[[dict[str, Any]], tuple[list[dict[str, Any]], dict[str, Any]]]] = {
-    "arxiv": fetch_arxiv,
-    "biorxiv": fetch_biorxiv,
-    "journal": fetch_crossref,
-    "nature": fetch_crossref,
-    "science": fetch_crossref,
-}
-SUPPORTED_SOURCE_TYPES = {*FETCHERS, "venue"}
+SUPPORTED_SOURCE_TYPES = {"venue", "arxiv", "biorxiv"}
 
 WORKFLOW_MODES = {"comprehensive", "focused", "incremental", "metadata_only"}
 STOP_AFTER_STAGES = {"metadata", "shortlist", "fulltext", "reading", "recommendation"}
@@ -862,6 +1000,8 @@ def migrate_metadata_caches() -> dict[str, Any]:
     METADATA_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
     moves: list[dict[str, Any]] = []
     removed_invalid_conference_caches: list[str] = []
+    removed_unsupported_metadata_namespaces: list[str] = []
+    removed_legacy_fulltext_aliases: list[str] = []
     for path in sorted(METADATA_CACHE_ROOT.glob("*.json")):
         if not re.fullmatch(r"[0-9a-f]{64}\.json", path.name):
             continue
@@ -913,7 +1053,16 @@ def migrate_metadata_caches() -> dict[str, Any]:
     for path in list(METADATA_CACHE_ROOT.glob("*/.http-state*.json")):
         label = path.parent.name + ("-" + path.stem.split(".http-state", 1)[-1].lstrip(".") if path.stem != ".http-state" else "")
         moves.append(_move_preserving(path, METADATA_CACHE_ROOT / ".state" / "http" / f"{label}.json"))
-    for directory in [path for path in METADATA_CACHE_ROOT.iterdir() if path.is_dir() and path.name in {"generic", "crossref", "openalex", "europepmc"}]:
+    for directory in [
+        path
+        for path in METADATA_CACHE_ROOT.iterdir()
+        if path.is_dir()
+        and path.name in {
+            "generic", "crossref", "openalex", "europepmc",
+            "journal", "nature", "science",
+        }
+    ]:
+        removed_unsupported_metadata_namespaces.append(str(directory))
         shutil.rmtree(directory)
     conference_root = METADATA_CACHE_ROOT / "conference"
     for path in conference_root.glob("*/*.json") if conference_root.is_dir() else []:
@@ -935,6 +1084,23 @@ def migrate_metadata_caches() -> dict[str, Any]:
         moves.append(_move_preserving(path, channel.metadata_cache_path(source)))
     if conference_root.is_dir():
         shutil.rmtree(conference_root)
+    for entry in catalog_entries():
+        channel = channel_for_spec({"type": "venue", "venue_id": entry["id"]})
+        channel_root = METADATA_CACHE_ROOT / entry["id"]
+        for path in channel_root.glob("*.json") if channel_root.is_dir() else []:
+            payload = read_json(path, {})
+            source = payload.get("source") if isinstance(payload, dict) and isinstance(payload.get("source"), dict) else {}
+            valid = False
+            try:
+                valid = (
+                    path.stem == str(int((source.get("years") or [0])[0]))
+                    and channel.validate_cache(payload, source)[0]
+                )
+            except (KeyError, TypeError, ValueError):
+                valid = False
+            if not valid:
+                removed_invalid_conference_caches.append(str(path))
+                path.unlink()
     for path in (METADATA_CACHE_ROOT / "biorxiv").glob("*.json") if (METADATA_CACHE_ROOT / "biorxiv").is_dir() else []:
         payload = read_json(path, {})
         is_daily = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}\.json", path.name))
@@ -975,6 +1141,10 @@ def migrate_metadata_caches() -> dict[str, Any]:
             moves.append(_move_preserving(path, DATA_ROOT / "state" / "http" / path.name))
     if (METADATA_CACHE_ROOT / ".state").exists():
         shutil.rmtree(METADATA_CACHE_ROOT / ".state")
+    legacy_fulltext_aliases = FULLTEXT_CACHE_ROOT / "_aliases"
+    if legacy_fulltext_aliases.is_dir():
+        removed_legacy_fulltext_aliases.append(str(legacy_fulltext_aliases))
+        shutil.rmtree(legacy_fulltext_aliases)
     recovered = _recover_conference_caches_from_runs()
     manifest_path = DATA_ROOT / "state" / "metadata-cache-migration.json"
     write_json(manifest_path, {
@@ -982,6 +1152,8 @@ def migrate_metadata_caches() -> dict[str, Any]:
         "migrated_at": now_iso(),
         "moves": moves,
         "removed_invalid_conference_caches": removed_invalid_conference_caches,
+        "removed_unsupported_metadata_namespaces": removed_unsupported_metadata_namespaces,
+        "removed_legacy_fulltext_aliases": removed_legacy_fulltext_aliases,
         "recovered_conferences": recovered,
     })
     return {
@@ -989,6 +1161,8 @@ def migrate_metadata_caches() -> dict[str, Any]:
         "moved_or_deduplicated": len(moves),
         "moves": moves,
         "removed_invalid_conference_caches": removed_invalid_conference_caches,
+        "removed_unsupported_metadata_namespaces": removed_unsupported_metadata_namespaces,
+        "removed_legacy_fulltext_aliases": removed_legacy_fulltext_aliases,
         "recovered_conferences": recovered,
         "inventory": metadata_cache_inventory(),
         "manifest": str(manifest_path),
@@ -999,6 +1173,8 @@ def fetch_source(spec: dict[str, Any], *, policy: str, max_age_days: float) -> t
     identity = dict(spec)
     cache_key = stable_hash(identity)
     kind = clean(spec.get("type")).lower()
+    if kind not in SUPPORTED_SOURCE_TYPES:
+        raise ValueError(f"Unsupported metadata source type: {kind}")
     if kind == "arxiv":
         papers, arxiv_receipt = channel_for_spec(spec).fetch_metadata(
             spec, policy=policy, max_age_days=max_age_days
@@ -1036,19 +1212,13 @@ def fetch_source(spec: dict[str, Any], *, policy: str, max_age_days: float) -> t
             return cached["papers"], {"status": "cache_hit", "cache_path": str(cache_path), "fetched_at": cached.get("fetched_at"), "count": len(cached["papers"]), "details": cached_receipt}
     if policy == "only":
         raise FileNotFoundError(f"No usable metadata cache for source {cache_key}")
-    channel = channel_for_spec(spec) if kind == "venue" else None
-    papers, source_receipt = (
-        channel.fetch_metadata(spec) if channel is not None else FETCHERS[kind](spec)
-    )
+    if kind != "venue":
+        raise ValueError(f"Unsupported metadata source type: {kind}")
+    channel = channel_for_spec(spec)
+    papers, source_receipt = channel.fetch_metadata(spec)
     if kind == "venue" and source_receipt.get("complete_catalog") is not True:
         raise RuntimeError("Venue adapter did not prove complete-catalog acquisition")
     normalized = [normalize(item, kind) for item in papers if isinstance(item, dict) and clean(item.get("title"))]
-    if kind == "venue":
-        candidate_payload = {"papers": normalized, "receipt": source_receipt}
-        complete, audit = _complete_conference_cache(candidate_payload, spec)
-        if not complete:
-            raise RuntimeError(f"Conference metadata cannot be cached until every record has a real abstract: {audit}")
-        source_receipt["metadata_audit"] = audit
     if kind == "venue" and isinstance(source_receipt.get("effective_years"), list) and len(source_receipt["effective_years"]) == 1:
         effective_spec = dict(spec)
         effective_spec["years"] = [int(source_receipt["effective_years"][0])]
@@ -1062,6 +1232,13 @@ def fetch_source(spec: dict[str, Any], *, policy: str, max_age_days: float) -> t
         "papers": normalized,
         "receipt": source_receipt,
     }
+    complete, audit = channel.validate_cache(payload, spec)
+    if not complete:
+        raise RuntimeError(
+            "Conference metadata cannot be cached until its source, year, "
+            f"catalog size, identities, and abstracts are proven: {audit}"
+        )
+    source_receipt["metadata_audit"] = audit
     write_json(cache_path, payload)
     return normalized, {"status": "cache_miss", "cache_path": str(cache_path), "fetched_at": payload["fetched_at"], "count": len(normalized), "details": source_receipt}
 
@@ -1078,5 +1255,17 @@ def deduplicate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def catalog(query: str = "") -> dict[str, Any]:
     needle = clean(query).lower()
-    venues = [dict(item) for item in DEFAULT_VENUES if not needle or needle in json.dumps(item).lower()]
-    return {"query": query, "count": len(venues), "venues": venues, "custom_venue_policy": "Use a built-in official adapter whenever the venue is catalogued. Custom venues may use OpenReview with an official venue ID or DBLP complete-volume XML, but title-only DBLP metadata is not a verified priority-venue corpus."}
+    venues = [
+        item
+        for item in catalog_entries()
+        if not needle or needle in json.dumps(item).lower()
+    ]
+    return {
+        "query": query,
+        "count": len(venues),
+        "venues": venues,
+        "custom_venue_policy": (
+            "Only registered channels are supported. Add a channel module and "
+            "registry entry before using another venue."
+        ),
+    }
