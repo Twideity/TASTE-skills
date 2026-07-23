@@ -472,7 +472,11 @@ def get(url: str, *, params: dict | None = None, headers: dict | None = None, ti
     policy = _request_policy.get()
     configured_attempts = policy.get("max_attempts")
     max_wait_seconds = policy.get("max_wait_seconds")
-    max_attempts = max(1, int(configured_attempts)) if configured_attempts is not None else (8 if family == "arxiv" else 5)
+    # Match TASTE's bounded arXiv behavior: three attempts are enough to
+    # distinguish a transient request from a sustained shared-IP throttle.
+    # Daily/month staging makes a later invocation resumable; eight attempts
+    # with exponential 30/60/120/... waits could pin one page for 22.5 minutes.
+    max_attempts = max(1, int(configured_attempts)) if configured_attempts is not None else (3 if family == "arxiv" else 5)
     candidates = _dblp_url_candidates(url) if family == "dblp" else [url]
     candidate_index = 0
     for attempt in range(1, max_attempts + 1):

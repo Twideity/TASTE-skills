@@ -16,7 +16,7 @@ import fitz
 from bs4 import BeautifulSoup
 
 from .credentials import openreview_settings
-from .conference_sources import official_pdf_candidates
+from .channels import channel_for_paper
 from .http import bounded_request_policy, cooldown_remaining, get, receipt, service_call, service_for
 from .metadata import clean, paper_identity
 from .storage import FULLTEXT_CACHE_ROOT, now_iso, read_json, safe_write_target, stable_hash, update_run, write_json, write_text
@@ -27,6 +27,8 @@ ACQUISITION_SCHEMA_VERSION = 2
 _cache_publish_lock = threading.Lock()
 _openreview_client_lock = threading.Lock()
 _openreview_client_cache: dict[tuple[str, str], tuple[Any, dict[str, Any]]] = {}
+_channel_pdf_locks_guard = threading.Lock()
+_channel_pdf_slots: dict[str, threading.BoundedSemaphore] = {}
 
 
 def _openalex_params() -> dict[str, str]:
@@ -238,7 +240,11 @@ def _candidate_urls(paper: dict[str, Any], *, include_oa_lookups: bool = True) -
             seen.add(value)
             candidates.append({"url": value, "kind": kind})
 
-    for candidate in official_pdf_candidates(paper):
+    try:
+        owning_channel = channel_for_paper(paper)
+    except KeyError:
+        owning_channel = None
+    for candidate in owning_channel.pdf_candidates(paper) if owning_channel is not None else []:
         add(candidate["url"], candidate["kind"])
     if not include_oa_lookups:
         for page_url in (clean(paper.get("url")), clean((paper.get("metadata") or {}).get("url") if isinstance(paper.get("metadata"), dict) else "")):
@@ -703,6 +709,32 @@ def cache_key(paper: dict[str, Any]) -> str:
     return stable_hash({"schema": ACQUISITION_SCHEMA_VERSION, "identity": paper_identity(paper)})
 
 
+def _cache_channel(paper: dict[str, Any]) -> str:
+    try:
+        return channel_for_paper(paper).id
+    except KeyError:
+        return "other"
+
+
+def cache_directory(paper: dict[str, Any]) -> Path:
+    return FULLTEXT_CACHE_ROOT / _cache_channel(paper) / cache_key(paper)
+
+
+def _channel_pdf_slot(paper: dict[str, Any]) -> threading.BoundedSemaphore:
+    try:
+        channel = channel_for_paper(paper)
+        channel_id = channel.id
+        capacity = max(1, int(channel.pdf_workers))
+    except (KeyError, TypeError, ValueError):
+        channel_id, capacity = "other", 1
+    with _channel_pdf_locks_guard:
+        slot = _channel_pdf_slots.get(channel_id)
+        if slot is None:
+            slot = threading.BoundedSemaphore(capacity)
+            _channel_pdf_slots[channel_id] = slot
+        return slot
+
+
 def _cache_aliases(paper: dict[str, Any]) -> list[str]:
     identifiers = paper.get("identifiers") if isinstance(paper.get("identifiers"), dict) else {}
     aliases = []
@@ -720,7 +752,8 @@ def _cache_aliases(paper: dict[str, Any]) -> list[str]:
     year = clean(paper.get("year") or str(paper.get("published") or "")[:4])
     if title:
         aliases.append(f"title:{title}|author:{first_author}|year:{year}")
-    return list(dict.fromkeys(aliases))
+    channel = _cache_channel(paper)
+    return [f"channel:{channel}|{alias}" for alias in dict.fromkeys(aliases)]
 
 
 def _alias_path(alias: str) -> Path:
@@ -737,8 +770,8 @@ def _cached_from_directory(paper: dict[str, Any], directory: Path) -> dict[str, 
     wanted_aliases = set(_cache_aliases(paper))
     cached_aliases = set(_cache_aliases(cached_paper))
     for prefix in ("doi:", "arxiv_id:", "openreview_id:", "pmcid:"):
-        wanted_exact = {alias for alias in wanted_aliases if alias.startswith(prefix)}
-        cached_exact = {alias for alias in cached_aliases if alias.startswith(prefix)}
+        wanted_exact = {alias for alias in wanted_aliases if f"|{prefix}" in alias}
+        cached_exact = {alias for alias in cached_aliases if f"|{prefix}" in alias}
         if wanted_exact and cached_exact and wanted_exact.isdisjoint(cached_exact):
             return None
     if not wanted_aliases & cached_aliases:
@@ -751,7 +784,7 @@ def _cached_from_directory(paper: dict[str, Any], directory: Path) -> dict[str, 
 
 
 def cached(paper: dict[str, Any]) -> dict[str, Any] | None:
-    direct = _cached_from_directory(paper, FULLTEXT_CACHE_ROOT / cache_key(paper))
+    direct = _cached_from_directory(paper, cache_directory(paper))
     if direct:
         return direct
     for alias in _cache_aliases(paper):
@@ -780,7 +813,7 @@ def _rewrite_root(value: Any, source: Path, destination: Path) -> Any:
 def publish_cache(paper: dict[str, Any], work_dir: Path, result: dict[str, Any]) -> dict[str, Any]:
     if result.get("full_text_available") is not True:
         return result
-    destination = safe_write_target(FULLTEXT_CACHE_ROOT / cache_key(paper))
+    destination = safe_write_target(cache_directory(paper))
     with _cache_publish_lock:
         existing = cached(paper)
         if existing:
@@ -828,8 +861,9 @@ def acquire_many(papers: list[dict[str, Any]], run_dir: Path, workers: int) -> d
             return hit
         paper_dir.mkdir(parents=True, exist_ok=True)
         try:
-            result = acquire(paper, paper_dir)
-            result = publish_cache(paper, paper_dir, result)
+            with _channel_pdf_slot(paper):
+                result = acquire(paper, paper_dir)
+                result = publish_cache(paper, paper_dir, result)
         except Exception as exc:
             result = {
                 "schema_version": ACQUISITION_SCHEMA_VERSION,

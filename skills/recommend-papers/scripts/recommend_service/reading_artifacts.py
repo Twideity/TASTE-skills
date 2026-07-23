@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .fulltext import FULLTEXT_CACHE_ROOT, cache_key
+from .fulltext import cache_directory
 from .metadata import clean
 from .storage import now_iso, read_json, require_run, safe_write_target, stable_hash, update_run, write_json, write_text
 
@@ -159,7 +159,7 @@ def _paper_dir(run_dir: Path, item: dict[str, Any]) -> Path:
 
 def _read_cache(item: dict[str, Any]) -> Path:
     paper = item.get("paper") if isinstance(item.get("paper"), dict) else {}
-    return FULLTEXT_CACHE_ROOT / cache_key(paper) / "reading"
+    return cache_directory(paper) / "reading"
 
 
 def _markdown_link(label: str, url: Any) -> str:

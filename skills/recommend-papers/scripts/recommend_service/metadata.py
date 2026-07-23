@@ -19,7 +19,7 @@ from bs4 import BeautifulSoup
 from .credentials import openreview_settings
 from .http import ServiceRequestDeferred, bounded_request_policy, get, receipt, service_call
 from .storage import DATA_ROOT, METADATA_CACHE_ROOT, now_iso, read_json, require_run, stable_hash, update_run, write_json
-from .venue_sources import fetch_official_venue
+from .channels import channel_for_spec
 
 
 ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
@@ -120,21 +120,19 @@ def _days(start_date: str, end_date: str) -> list[str]:
 
 
 def _arxiv_day_cache_path(category: str, day: str) -> Path:
-    safe_category = re.sub(r"[^A-Za-z0-9._-]+", "_", category)
-    return METADATA_CACHE_ROOT / "arxiv" / safe_category / f"{day}.json"
+    return channel_for_spec({"type": "arxiv"}).day_cache_path(category, day)
 
 
 def _arxiv_page_stage_path(category: str, start_date: str, end_date: str, offset: int) -> Path:
-    safe_category = re.sub(r"[^A-Za-z0-9._-]+", "_", category)
-    return DATA_ROOT / "state" / "arxiv-staging" / safe_category / f"{start_date}_{end_date}" / f"{offset:06d}.json"
+    return channel_for_spec({"type": "arxiv"}).page_stage_path(category, start_date, end_date, offset)
 
 
 def _biorxiv_day_cache_path(day: str) -> Path:
-    return METADATA_CACHE_ROOT / "biorxiv" / f"{day}.json"
+    return channel_for_spec({"type": "biorxiv"}).day_cache_path(day)
 
 
 def _biorxiv_page_stage_path(start_date: str, end_date: str, cursor: int) -> Path:
-    return DATA_ROOT / "state" / "biorxiv-staging" / f"{start_date}_{end_date}" / f"{cursor:06d}.json"
+    return channel_for_spec({"type": "biorxiv"}).page_stage_path(start_date, end_date, cursor)
 
 
 def _arxiv_month_chunks(days: list[str]) -> list[list[str]]:
@@ -616,6 +614,15 @@ def _fetch_venue_exact(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict
     merged.update({key: value for key, value in spec.items() if value not in (None, "", [])})
     adapter = adapter or clean(merged.get("adapter")).lower() or "dblp"
     merged.setdefault("venue", merged.get("name") or merged.get("query") or venue_id)
+    if known:
+        rows, details = channel_for_spec(merged).fetch_metadata(merged)
+        minimum_catalog_records = max(1, int(merged.get("minimum_catalog_records") or 1))
+        if len(rows) < minimum_catalog_records:
+            raise RuntimeError(
+                f"{venue_id} channel catalog has only {len(rows)} records, below "
+                f"minimum_catalog_records={minimum_catalog_records}"
+            )
+        return rows, details
     if adapter == "openreview":
         rows, details = fetch_openreview_venue(merged)
         minimum_catalog_records = max(1, int(merged.get("minimum_catalog_records") or 1))
@@ -629,7 +636,7 @@ def _fetch_venue_exact(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict
     if adapter == "dblp":
         return fetch_dblp_venue(merged)
     if adapter in {"neurips_official", "icml_official", "acm_enriched", "aaai_ojs", "cvf_openaccess", "acl_anthology", "ijcai_proceedings", "eccv_virtual"}:
-        rows, details = fetch_official_venue(merged)
+        rows, details = channel_for_spec(merged).fetch_metadata(merged)
         normalized = [normalize(row, "venue") for row in rows]
         try:
             minimum_catalog_records = max(1, int(merged.get("minimum_catalog_records") or 1))
@@ -663,8 +670,10 @@ def fetch_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, A
     for year in candidates:
         known = next((item for item in DEFAULT_VENUES if item["id"] == clean(spec.get("venue_id"))), {})
         primary_adapter = clean(spec.get("adapter") or known.get("adapter")).lower()
-        adapters = [primary_adapter, *[clean(item).lower() for item in known.get("fallback_adapters") or []]]
-        adapters = list(dict.fromkeys(item for item in adapters if item)) or [""]
+        fallback_adapters = [clean(value).lower() for value in known.get("fallback_adapters") or []]
+        adapters = ([primary_adapter] if known else list(dict.fromkeys(
+            item for item in [primary_adapter, *fallback_adapters] if item
+        ))) or [""]
         for adapter in adapters:
             candidate = dict(spec)
             candidate["years"] = [year]
@@ -714,11 +723,21 @@ def fetch_openreview_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             ),
             max_attempts=5,
         )
-    except Exception:
-        raise RuntimeError("OpenReview official client initialization failed after shared-channel retries")
+    except Exception as exc:
+        raise RuntimeError(
+            f"OpenReview official client initialization failed after shared-channel retries: "
+            f"{type(exc).__name__}: {str(exc)[:300]}"
+        ) from exc
     rows: list[dict[str, Any]] = []
     requests_info = []
     probe_limit = max(0, int(spec.get("_probe_limit") or 0))
+    # A three-record diagnostic sample is sufficient to inspect field quality,
+    # but it cannot distinguish a real conference catalog from an early
+    # OpenReview venue containing only a handful of public notes.  During a
+    # probe, inspect at most ten notes while still returning only three
+    # diagnostic samples.  This remains bounded and prevents false latest-year
+    # resolution such as ECCV 2026's four preliminary records.
+    probe_discovery_limit = max(probe_limit, 10) if probe_limit else 0
     for year in years:
         venue_id = clean(spec.get("openreview_venue_id"))
         if not venue_id:
@@ -732,7 +751,7 @@ def fetch_openreview_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             offset = 0
             rows_before_query = len(rows)
             while True:
-                page_limit = min(1000, probe_limit - len(rows)) if probe_limit else 1000
+                page_limit = min(1000, probe_discovery_limit - len(rows)) if probe_limit else 1000
                 if page_limit <= 0:
                     break
                 notes, retry_errors = service_call(
@@ -765,14 +784,14 @@ def fetch_openreview_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], 
                         "identifiers": {"openreview_id": note_id, "doi": clean(_openreview_value(content.get("doi")))},
                     })
                 offset += len(notes)
-                if probe_limit and len(rows) >= probe_limit:
+                if probe_limit and len(rows) >= probe_discovery_limit:
                     break
                 if len(notes) < page_limit:
                     break
                 time.sleep(2.1)
             if len(rows) > rows_before_query:
                 break
-        if probe_limit and len(rows) >= probe_limit:
+        if probe_limit and len(rows) >= probe_discovery_limit:
             break
     if probe_limit:
         samples = rows[:probe_limit]
@@ -790,6 +809,8 @@ def fetch_openreview_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             "login_retry_errors": login_errors,
             "requests": requests_info,
             "count": len(samples),
+            "discovered_record_count": len(rows),
+            "probe_catalog_floor": probe_discovery_limit,
             "sample_limit": probe_limit,
             "missing_sample_abstracts": missing,
             "metadata_sample_complete": bool(samples) and missing == 0,
@@ -880,6 +901,14 @@ def _complete_conference_cache(payload: Any, source: dict[str, Any]) -> tuple[bo
         and bool(receipt_data.get("exhaustion_proof"))
         and audit["metadata_completeness_ok"]
     )
+    # Older caches could mark a smaller OpenReview subset as the complete
+    # NeurIPS catalog after the larger official proceedings pool had only a
+    # handful of missing abstracts.  NeurIPS caches must preserve the official
+    # pool and use exact-identity fallbacks only to fill fields within it.
+    if venue_id in {"neurips", "nips"}:
+        complete = complete and clean(receipt_data.get("adapter")) == "neurips_official_papers"
+    if venue_id == "eccv":
+        complete = complete and clean(receipt_data.get("adapter")) == "eccv_virtual"
     return complete, audit
 
 
@@ -1110,11 +1139,7 @@ def _cache_fresh(payload: dict[str, Any], max_age_days: float) -> bool:
 def _source_cache_path(spec: dict[str, Any], cache_key: str) -> Path:
     kind = re.sub(r"[^a-z0-9._-]+", "_", clean(spec.get("type")).lower()) or "unknown"
     if kind == "venue":
-        raw_venue = clean(spec.get("venue_id") or spec.get("venue") or "unknown")
-        venue = PRIORITY_VENUE_NAMES.get(raw_venue.lower(), re.sub(r"[^A-Za-z0-9._-]+", "_", raw_venue))
-        years = [int(item) for item in spec.get("years") or []]
-        year = str(years[0]) if len(years) == 1 else "unknown-year"
-        return METADATA_CACHE_ROOT / "conference" / venue / f"{year}.json"
+        return channel_for_spec(spec).metadata_cache_path(spec)
     start = date_text(spec.get("start_date")) or "undated"
     end = date_text(spec.get("end_date")) or "undated"
     return METADATA_CACHE_ROOT / kind / f"{start}_{end}_{cache_key[:12]}.json"
@@ -1187,7 +1212,8 @@ def _recover_conference_caches_from_runs() -> list[dict[str, Any]]:
         papers = [paper for paper in metadata.get("papers") or [] if isinstance(paper, dict) and clean(paper.get("venue")).lower() in venue_names]
         if len(papers) != int(row.get("paper_count") or 0) or len(papers) != int(details.get("count") or 0):
             continue
-        payload = {"schema_version": 1, "cache_key": stable_hash(source), "source": source, "fetched_at": clean((row.get("cache") or {}).get("fetched_at")) or now_iso(), "papers": papers, "receipt": details}
+        channel = channel_for_spec(source)
+        payload = {"schema_version": channel.metadata_schema, "channel": channel.id, "cache_key": stable_hash(source), "source": source, "fetched_at": clean((row.get("cache") or {}).get("fetched_at")) or now_iso(), "papers": papers, "receipt": details}
         complete, audit = _complete_conference_cache(payload, source)
         if not complete:
             continue
@@ -1231,8 +1257,12 @@ def migrate_metadata_caches() -> dict[str, Any]:
                     path.unlink()
                 continue
             winner, payload = max(complete, key=lambda item: (str(item[1].get("fetched_at") or ""), len(item[1].get("papers") or [])))
-            canonical_venue = PRIORITY_VENUE_NAMES.get(venue, venue)
-            moves.append(_move_preserving(winner, METADATA_CACHE_ROOT / "conference" / canonical_venue / f"{year}.json"))
+            source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+            channel = channel_for_spec(source)
+            payload["schema_version"] = channel.metadata_schema
+            payload["channel"] = channel.id
+            write_json(winner, payload)
+            moves.append(_move_preserving(winner, channel.metadata_cache_path(source)))
             for path, _ in candidates:
                 if path.exists():
                     path.unlink()
@@ -1251,22 +1281,25 @@ def migrate_metadata_caches() -> dict[str, Any]:
     for directory in [path for path in METADATA_CACHE_ROOT.iterdir() if path.is_dir() and path.name in {"generic", "crossref", "openalex", "europepmc"}]:
         shutil.rmtree(directory)
     conference_root = METADATA_CACHE_ROOT / "conference"
-    for old_name, new_name in (("iclr", "ICLR"), ("icml", "ICML"), ("neurips", "NeurIPS")):
-        old = conference_root / old_name
-        if old.is_dir():
-            temporary = conference_root / f".case-rename-{old_name}"
-            if temporary.exists():
-                shutil.rmtree(temporary)
-            os.replace(old, temporary)
-            for path in temporary.glob("*.json"):
-                moves.append(_move_preserving(path, conference_root / new_name / path.name))
-            shutil.rmtree(temporary)
     for path in conference_root.glob("*/*.json") if conference_root.is_dir() else []:
         payload = read_json(path, {})
         source = payload.get("source") if isinstance(payload, dict) and isinstance(payload.get("source"), dict) else {}
+        try:
+            channel = channel_for_spec(source)
+        except KeyError:
+            removed_invalid_conference_caches.append(str(path))
+            path.unlink()
+            continue
         if not _complete_conference_cache(payload, source)[0]:
             removed_invalid_conference_caches.append(str(path))
             path.unlink()
+            continue
+        payload["schema_version"] = channel.metadata_schema
+        payload["channel"] = channel.id
+        write_json(path, payload)
+        moves.append(_move_preserving(path, channel.metadata_cache_path(source)))
+    if conference_root.is_dir():
+        shutil.rmtree(conference_root)
     for path in (METADATA_CACHE_ROOT / "biorxiv").glob("*.json") if (METADATA_CACHE_ROOT / "biorxiv").is_dir() else []:
         payload = read_json(path, {})
         is_daily = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}\.json", path.name))
@@ -1332,10 +1365,14 @@ def fetch_source(spec: dict[str, Any], *, policy: str, max_age_days: float) -> t
     cache_key = stable_hash(identity)
     kind = clean(spec.get("type")).lower()
     if kind == "arxiv":
-        papers, arxiv_receipt = fetch_arxiv_cached(spec, policy=policy, max_age_days=max_age_days)
+        papers, arxiv_receipt = channel_for_spec(spec).fetch_metadata(
+            spec, policy=policy, max_age_days=max_age_days
+        )
         return papers, {"status": "cache_hit" if all(item.get("cache_status") == "hit" for item in arxiv_receipt["category_receipts"]) else "cache_miss", "count": len(papers), "details": arxiv_receipt}
     if kind == "biorxiv":
-        papers, biorxiv_receipt = fetch_biorxiv_cached(spec, policy=policy, max_age_days=max_age_days)
+        papers, biorxiv_receipt = channel_for_spec(spec).fetch_metadata(
+            spec, policy=policy, max_age_days=max_age_days
+        )
         return papers, {"status": "cache_hit" if biorxiv_receipt["cache_status"] == "hit" else "cache_miss", "count": len(papers), "details": biorxiv_receipt}
     cache_specs = [spec]
     cache_paths = [_source_cache_path(item, stable_hash(item)) for item in cache_specs]
@@ -1359,12 +1396,15 @@ def fetch_source(spec: dict[str, Any], *, policy: str, max_age_days: float) -> t
             else True
         )
         if kind == "venue":
-            cache_has_required_coverage, _audit = _complete_conference_cache(cached, spec)
+            cache_has_required_coverage, _audit = channel_for_spec(spec).validate_cache(cached, spec)
         if cache_has_required_coverage:
             return cached["papers"], {"status": "cache_hit", "cache_path": str(cache_path), "fetched_at": cached.get("fetched_at"), "count": len(cached["papers"]), "details": cached_receipt}
     if policy == "only":
         raise FileNotFoundError(f"No usable metadata cache for source {cache_key}")
-    papers, source_receipt = FETCHERS[kind](spec)
+    channel = channel_for_spec(spec) if kind == "venue" else None
+    papers, source_receipt = (
+        channel.fetch_metadata(spec) if channel is not None else FETCHERS[kind](spec)
+    )
     if kind == "venue" and source_receipt.get("complete_catalog") is not True:
         raise RuntimeError("Venue adapter did not prove complete-catalog acquisition")
     normalized = [normalize(item, kind) for item in papers if isinstance(item, dict) and clean(item.get("title"))]
@@ -1378,7 +1418,15 @@ def fetch_source(spec: dict[str, Any], *, policy: str, max_age_days: float) -> t
         effective_spec = dict(spec)
         effective_spec["years"] = [int(source_receipt["effective_years"][0])]
         cache_path = _source_cache_path(effective_spec, stable_hash(effective_spec))
-    payload = {"schema_version": 1, "cache_key": cache_key, "source": spec, "fetched_at": now_iso(), "papers": normalized, "receipt": source_receipt}
+    payload = {
+        "schema_version": channel.metadata_schema if channel is not None else 1,
+        "channel": channel.id if channel is not None else kind,
+        "cache_key": cache_key,
+        "source": spec,
+        "fetched_at": now_iso(),
+        "papers": normalized,
+        "receipt": source_receipt,
+    }
     write_json(cache_path, payload)
     return normalized, {"status": "cache_miss", "cache_path": str(cache_path), "fetched_at": payload["fetched_at"], "count": len(normalized), "details": source_receipt}
 
@@ -1409,21 +1457,47 @@ def _probe_venue_exact(spec: dict[str, Any], sample_limit: int) -> tuple[list[di
     merged["adapter"] = adapter
     merged["_probe_limit"] = max(1, int(sample_limit or 1))
     merged.setdefault("venue", merged.get("name") or merged.get("query") or venue_id)
+    if known:
+        rows, details = channel_for_spec(merged).fetch_metadata(merged)
+        if adapter == "openreview" and int(details.get("discovered_record_count") or len(rows)) < int(details.get("probe_catalog_floor") or 10):
+            raise RuntimeError(
+                "authoritative incomplete OpenReview probe catalog: "
+                f"discovered={details.get('discovered_record_count') or len(rows)}, floor={details.get('probe_catalog_floor') or 10}"
+            )
+        return rows, details
     if adapter == "openreview":
-        return fetch_openreview_venue(merged)
+        rows, details = fetch_openreview_venue(merged)
+        if known and int(details.get("discovered_record_count") or len(rows)) < int(details.get("probe_catalog_floor") or 10):
+            raise RuntimeError(
+                "authoritative incomplete OpenReview probe catalog: "
+                f"discovered={details.get('discovered_record_count') or len(rows)}, floor={details.get('probe_catalog_floor') or 10}"
+            )
+        return rows, details
     if adapter == "dblp":
         return fetch_dblp_venue(merged)
-    return fetch_official_venue(merged)
+    return channel_for_spec(merged).fetch_metadata(merged)
 
 
 def _transient_probe_error(exc: BaseException) -> bool:
     if isinstance(exc, ServiceRequestDeferred):
         return True
-    text = f"{type(exc).__name__}: {exc}".lower()
-    return any(marker in text for marker in (
-        "429", "rate limit", "ratelimit", "too many requests", "timeout", "timed out",
-        "connection", "temporarily", "503", "502", "500", "cooldown", "deferred",
-    ))
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ServiceRequestDeferred):
+            return True
+        response = getattr(current, "response", None)
+        if response is not None and getattr(response, "status_code", None) in {429, 500, 502, 503, 504}:
+            return True
+        text = f"{type(current).__name__}: {current}".lower()
+        if any(marker in text for marker in (
+            "429", "rate limit", "ratelimit", "too many requests", "timeout", "timed out",
+            "connection", "temporarily", "503", "502", "500", "cooldown", "deferred",
+        )):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _authoritative_probe_empty(exc: BaseException) -> bool:
@@ -1436,6 +1510,7 @@ def _authoritative_probe_empty(exc: BaseException) -> bool:
         "404 client error",
         "official proceedings index unavailable",
         "has no published issue for",
+        "authoritative incomplete openreview probe catalog",
     ))
 
 
@@ -1449,18 +1524,21 @@ def probe_venue(
     attempts: list[dict[str, Any]] = []
     result: dict[str, Any] | None = None
     try:
-        probe_wall_timeout = max(5.0, min(300.0, float(os.environ.get("RECOMMEND_PAPERS_PROBE_WALL_TIMEOUT_SECONDS", "30") or 30)))
+        probe_wall_timeout = max(5.0, min(300.0, float(os.environ.get("RECOMMEND_PAPERS_PROBE_WALL_TIMEOUT_SECONDS", "60") or 60)))
     except (TypeError, ValueError):
-        probe_wall_timeout = 30.0
+        probe_wall_timeout = 60.0
     for year in range(start_year, start_year - max(1, lookback), -1):
         if not _regular_venue_year(clean(spec.get("venue_id")).lower(), year):
             attempts.append({"year": year, "status": "not_scheduled", "count": 0})
             continue
         known = next((item for item in DEFAULT_VENUES if item["id"] == clean(spec.get("venue_id"))), {})
         primary = clean(spec.get("adapter") or known.get("adapter")).lower()
-        adapters = list(dict.fromkeys(
+        # A built-in channel owns and audits its own fallback sequence.  Trying
+        # catalog fallback adapters here would execute the same channel more
+        # than once and make the receipt look like independent source evidence.
+        adapters = ([primary] if known else list(dict.fromkeys(
             item for item in [primary, *[clean(value).lower() for value in known.get("fallback_adapters") or []]] if item
-        )) or [""]
+        ))) or [""]
         transient_for_year = False
         error_for_year = False
         for adapter in adapters:
