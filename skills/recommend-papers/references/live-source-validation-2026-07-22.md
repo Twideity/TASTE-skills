@@ -89,3 +89,14 @@ anonymous OpenAIRE 60-request hourly window accumulated during validation while
 the anonymous OpenAlex daily state was already exhausted. Both waits must be
 reported; resume the same source after reset instead of silently retrying every
 paper or treating the partial checkpoint as a complete metadata cache.
+
+ACL follow-up validation on 2026-07-23 found that generic OpenGraph descriptions
+on paper pages contain citations (authors, venue, year), not abstracts. Two ACL
+2026 records missing XML abstracts had previously accepted those strings. The
+extractor now ignores generic description metadata and wildcard abstract DOM
+matches, extracts both missing abstracts from their official PDFs, and completes
+the cold corpus at 2,650/2,650 real abstracts. Cache validation also rejects the
+old citation-shaped values. A historical ACL 1979 event-page fallback discovers
+28 authored paper entries when the current year-level XML is absent, but the
+formal corpus correctly remains blocked because 27 papers expose no verifiable
+abstract; historical discovery must never be mislabeled as full metadata.

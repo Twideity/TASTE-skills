@@ -812,6 +812,22 @@ def fetch_openreview_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], 
     }
 
 
+def _conference_abstract_is_real(value: Any) -> bool:
+    text = clean(value)
+    if not text:
+        return False
+    lower = text.lower()
+    if lower.startswith("correct abstract if needed. retain xml formatting tags"):
+        return False
+    # ACL Anthology's OpenGraph description is a citation, normally formatted
+    # as "Authors. Proceedings/Findings ... YEAR.".  It was previously
+    # accepted as an abstract, so reject that exact bibliographic shape at
+    # every formal cache boundary as well as fixing the page extractor.
+    if re.search(r"\.\s+(?:proceedings|findings)\s+of\s+the\b.*\b(?:19|20)\d{2}\.?$", text, re.I):
+        return False
+    return True
+
+
 def venue_metadata_audit(rows: list[dict[str, Any]], *, require_official_categories: bool = False) -> dict[str, Any]:
     count = len(rows)
     identities = [paper_identity(row) for row in rows]
@@ -819,7 +835,12 @@ def venue_metadata_audit(rows: list[dict[str, Any]], *, require_official_categor
     titled = sum(bool(clean(row.get("title"))) for row in rows)
     authored = sum(bool(row.get("authors")) for row in rows)
     linked = sum(bool(clean(row.get("url") or row.get("pdf_url"))) for row in rows)
-    abstracted = sum(bool(clean(row.get("abstract"))) for row in rows)
+    invalid_abstracts = [
+        clean(row.get("title"))
+        for row in rows
+        if clean(row.get("abstract")) and not _conference_abstract_is_real(row.get("abstract"))
+    ]
+    abstracted = sum(_conference_abstract_is_real(row.get("abstract")) for row in rows)
     categorized = sum(bool(row.get("categories")) for row in rows)
     complete = bool(count and unique and titled == count and authored / count >= 0.95 and linked / count >= 0.95)
     complete = complete and abstracted == count
@@ -833,6 +854,8 @@ def venue_metadata_audit(rows: list[dict[str, Any]], *, require_official_categor
         "author_coverage": round(authored / count, 6) if count else 0.0,
         "link_coverage": round(linked / count, 6) if count else 0.0,
         "abstract_coverage": round(abstracted / count, 6) if count else 0.0,
+        "invalid_abstract_count": len(invalid_abstracts),
+        "invalid_abstract_examples": invalid_abstracts[:5],
         "category_coverage": round(categorized / count, 6) if count else 0.0,
         "full_abstract_required": True,
         "official_categories_expected": require_official_categories,
@@ -1177,6 +1200,7 @@ def _recover_conference_caches_from_runs() -> list[dict[str, Any]]:
 def migrate_metadata_caches() -> dict[str, Any]:
     METADATA_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
     moves: list[dict[str, Any]] = []
+    removed_invalid_conference_caches: list[str] = []
     for path in sorted(METADATA_CACHE_ROOT.glob("*.json")):
         if not re.fullmatch(r"[0-9a-f]{64}\.json", path.name):
             continue
@@ -1237,6 +1261,12 @@ def migrate_metadata_caches() -> dict[str, Any]:
             for path in temporary.glob("*.json"):
                 moves.append(_move_preserving(path, conference_root / new_name / path.name))
             shutil.rmtree(temporary)
+    for path in conference_root.glob("*/*.json") if conference_root.is_dir() else []:
+        payload = read_json(path, {})
+        source = payload.get("source") if isinstance(payload, dict) and isinstance(payload.get("source"), dict) else {}
+        if not _complete_conference_cache(payload, source)[0]:
+            removed_invalid_conference_caches.append(str(path))
+            path.unlink()
     for path in (METADATA_CACHE_ROOT / "biorxiv").glob("*.json") if (METADATA_CACHE_ROOT / "biorxiv").is_dir() else []:
         payload = read_json(path, {})
         is_daily = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}\.json", path.name))
@@ -1279,8 +1309,22 @@ def migrate_metadata_caches() -> dict[str, Any]:
         shutil.rmtree(METADATA_CACHE_ROOT / ".state")
     recovered = _recover_conference_caches_from_runs()
     manifest_path = DATA_ROOT / "state" / "metadata-cache-migration.json"
-    write_json(manifest_path, {"schema_version": 2, "migrated_at": now_iso(), "moves": moves, "recovered_conferences": recovered})
-    return {"status": "complete", "moved_or_deduplicated": len(moves), "moves": moves, "recovered_conferences": recovered, "inventory": metadata_cache_inventory(), "manifest": str(manifest_path)}
+    write_json(manifest_path, {
+        "schema_version": 2,
+        "migrated_at": now_iso(),
+        "moves": moves,
+        "removed_invalid_conference_caches": removed_invalid_conference_caches,
+        "recovered_conferences": recovered,
+    })
+    return {
+        "status": "complete",
+        "moved_or_deduplicated": len(moves),
+        "moves": moves,
+        "removed_invalid_conference_caches": removed_invalid_conference_caches,
+        "recovered_conferences": recovered,
+        "inventory": metadata_cache_inventory(),
+        "manifest": str(manifest_path),
+    }
 
 
 def fetch_source(spec: dict[str, Any], *, policy: str, max_age_days: float) -> tuple[list[dict[str, Any]], dict[str, Any]]:

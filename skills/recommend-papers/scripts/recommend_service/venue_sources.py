@@ -83,12 +83,16 @@ def _meta(soup: BeautifulSoup, *names: str) -> str:
 
 
 def _abstract_from_soup(soup: BeautifulSoup) -> str:
-    value = _meta(soup, "citation_abstract", "dc.description", "description", "og:description")
+    # Generic description/og:description fields are commonly bibliographic
+    # snippets (author + venue + year), not abstracts.  Likewise, wildcard
+    # abstract selectors can match hidden correction-form help.  Only accept
+    # fields whose semantics or exact DOM role identify real abstract text.
+    value = _meta(soup, "citation_abstract")
     if value and len(value) >= 80:
         return re.sub(r"^abstract\s*[:—-]?\s*", "", value, flags=re.I)
     selectors = (
         "#abstract", ".abstract", ".abstractInFull", "section.abstract", "div.abstract",
-        "[class*='abstract']", "[id*='abstract']", "div[itemprop='description']",
+        "div[itemprop='description']",
     )
     for selector in selectors:
         node = soup.select_one(selector)
@@ -374,7 +378,7 @@ def fetch_acl_anthology(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dic
             for node in volume.findall("paper"):
                 title_node = node.find("title")
                 title = clean("".join(title_node.itertext()) if title_node is not None else "")
-                if not looks_like_title(title):
+                if not title:
                     continue
                 anthology_id = clean(node.findtext("url")) or f"{year}.{collection}-{volume.get('id')}.{node.get('id')}"
                 paper_url = f"https://aclanthology.org/{anthology_id.strip('/')}/"
@@ -389,9 +393,54 @@ def fetch_acl_anthology(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dic
                 abstract_node = node.find("abstract")
                 abstract = clean("".join(abstract_node.itertext()) if abstract_node is not None else "")
                 rows.append({"title": title, "abstract": abstract, "authors": authors, "published": f"{year}-01-01", "year": year, "url": paper_url, "pdf_url": paper_url.rstrip("/") + ".pdf", "venue": venue, "categories": [], "identifiers": {"doi": clean(node.findtext("doi")), "acl_anthology_id": anthology_id}, "metadata": {"official_xml": source_url}})
+    if not rows:
+        # Older ACL Anthology editions are live on the official event pages
+        # even when the current repository no longer exposes a year-level XML
+        # file (for example ACL 1979).  Preserve discovery and PDF locators;
+        # the common abstract gate still rejects a formal corpus when those
+        # historical papers genuinely have no published abstract.
+        event_url = f"https://aclanthology.org/events/{collection}-{year}/"
+        event_response = get(event_url, timeout=120)
+        requests.append(receipt(event_response))
+        if event_response.ok:
+            soup = BeautifulSoup(event_response.text, "html.parser")
+            for item in soup.select("div.d-sm-flex.align-items-stretch"):
+                title_node = item.select_one("strong a[href]")
+                title = clean(title_node.get_text(" ", strip=True) if title_node else "")
+                authors = [
+                    clean(node.get_text(" ", strip=True))
+                    for node in item.select('a[href*="/people/"]')
+                    if clean(node.get_text(" ", strip=True))
+                ]
+                if not title or not authors:
+                    continue
+                paper_url = urljoin(event_response.url, str(title_node.get("href") or ""))
+                if paper_url in seen:
+                    continue
+                seen.add(paper_url)
+                pdf_node = item.select_one('a[aria-label="Open PDF"][href], a[href$=".pdf"]')
+                anthology_id = paper_url.rstrip("/").rsplit("/", 1)[-1]
+                rows.append({
+                    "title": title,
+                    "abstract": "",
+                    "authors": authors,
+                    "published": f"{year}-01-01",
+                    "year": year,
+                    "url": paper_url,
+                    "pdf_url": urljoin(event_response.url, str(pdf_node.get("href") or "")) if pdf_node else "",
+                    "venue": venue,
+                    "categories": [],
+                    "identifiers": {"acl_anthology_id": anthology_id},
+                    "metadata": {"official_event_page": event_url},
+                })
     selected = _selected_rows(spec, rows)
     _enrich_all(selected, worker_count=1 if _probe_limit(spec) else 8)
-    return _finish_rows(spec, selected, adapter="acl_anthology", requests=requests, proof="official_acl_anthology_xml_exhausted_and_all_abstracts_present", discovered_count=len(rows))
+    proof = (
+        "official_acl_anthology_xml_exhausted_and_all_abstracts_present"
+        if any(clean(row.get("metadata", {}).get("official_xml")) for row in rows)
+        else "official_acl_anthology_event_page_exhausted_and_all_abstracts_present"
+    )
+    return _finish_rows(spec, selected, adapter="acl_anthology", requests=requests, proof=proof, discovered_count=len(rows))
 
 
 def _parse_ijcai_accepted(html_text: str, *, year: int, page_url: str) -> list[dict[str, Any]]:
