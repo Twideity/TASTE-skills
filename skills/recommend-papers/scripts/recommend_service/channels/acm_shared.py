@@ -15,8 +15,7 @@ import shutil
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextvars import copy_context
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import quote, urljoin
 
 from bs4 import BeautifulSoup
@@ -213,10 +212,7 @@ def _enrich_all(rows: list[dict[str, Any]], worker_count: int = 8) -> list[dict[
             _enrich_detail(row)
         return rows
     with ThreadPoolExecutor(max_workers=max(1, min(worker_count, len(pending)))) as pool:
-        # Probe request budgets live in a ContextVar. Thread-pool workers do
-        # not inherit that context automatically, so copy it per task or a
-        # three-row probe silently falls back to formal retry/time budgets.
-        futures = [pool.submit(copy_context().run, _enrich_detail, row) for row in pending]
+        futures = [pool.submit(_enrich_detail, row) for row in pending]
         for future in as_completed(futures):
             future.result()
     return rows
@@ -236,22 +232,12 @@ def _result(rows: list[dict[str, Any]], *, adapter: str, requests: list[dict[str
     }
 
 
-def _probe_limit(spec: dict[str, Any]) -> int:
-    try:
-        return max(0, int(spec.get("_probe_limit") or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
 def _detail_workers(spec: dict[str, Any], formal_workers: int = 8) -> int:
-    """Keep a three-row probe bounded without serializing slow detail pages."""
-    probe_limit = _probe_limit(spec)
-    return min(3, probe_limit) if probe_limit else formal_workers
+    return formal_workers
 
 
 def _selected_rows(spec: dict[str, Any], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    limit = _probe_limit(spec)
-    return rows[:limit] if limit else rows
+    return rows
 
 
 def _finish_rows(
@@ -263,254 +249,7 @@ def _finish_rows(
     proof: str,
     discovered_count: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    limit = _probe_limit(spec)
-    if not limit:
-        return _result(rows, adapter=adapter, requests=requests, proof=proof)
-    samples = rows[:limit]
-    missing = sum(not clean(row.get("abstract")) for row in samples)
-    return samples, {
-        "status": "sample_complete" if samples and not missing else ("sample_partial" if samples else "empty"),
-        "probe_only": True,
-        "complete_catalog": False,
-        "exhausted": False,
-        "truncated": bool(samples),
-        "exhaustion_proof": "probe_sample_only_not_a_complete_catalog",
-        "adapter": adapter,
-        "count": len(samples),
-        "sample_limit": limit,
-        "discovered_title_count": len(rows) if discovered_count is None else discovered_count,
-        "missing_sample_abstracts": missing,
-        "metadata_sample_complete": bool(samples) and missing == 0,
-        "requests": requests,
-    }
-
-
-def fetch_icml_official(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    year = int(spec["years"][0])
-    list_url = f"https://icml.cc/virtual/{year}/papers.html"
-    response = _response(list_url, timeout=90)
-    soup = BeautifulSoup(response.text, "html.parser")
-    rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for anchor in soup.find_all("a", href=True):
-        href = str(anchor.get("href") or "")
-        title = clean(anchor.get_text(" ", strip=True))
-        detail_url = urljoin(list_url, href)
-        if not looks_like_title(title) or not any(marker in href for marker in ("/poster/", "/oral/", "/paper/", "/spotlight/")) or detail_url in seen:
-            continue
-        seen.add(detail_url)
-        presentation = next((label for marker, label in (("/oral/", "oral"), ("/spotlight/", "spotlight"), ("/poster/", "poster")) if marker in href), "paper")
-        rows.append({"title": title, "abstract": "", "authors": [], "published": f"{year}-01-01", "year": year, "url": detail_url, "pdf_url": "", "venue": "ICML", "categories": [presentation], "presentation_type": presentation, "identifiers": {}, "metadata": {"official_index": list_url}})
-    selected = _selected_rows(spec, rows)
-    _enrich_all(selected, worker_count=_detail_workers(spec))
-    return _finish_rows(spec, selected, adapter="icml_official_virtual", requests=[receipt(response)], proof="official_icml_virtual_index_exhausted_and_all_details_enriched", discovered_count=len(rows))
-
-
-def fetch_cvf(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    venue = clean(spec.get("venue") or spec.get("name") or spec.get("venue_id")).upper()
-    year = int(spec["years"][0])
-    list_url = f"https://openaccess.thecvf.com/{venue}{year}?day=all"
-    response = _response(list_url)
-    soup = BeautifulSoup(response.text, "html.parser")
-    rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for node in soup.select("dt.ptitle a[href], dt a[href]"):
-        title = clean(node.get_text(" ", strip=True))
-        detail_url = urljoin(list_url, str(node.get("href") or ""))
-        if not looks_like_title(title) or detail_url in seen:
-            continue
-        seen.add(detail_url)
-        parent = node.find_parent("dt")
-        authors: list[str] = []
-        pdf_url = ""
-        for sibling in parent.find_next_siblings(["dd", "dt"]) if parent else []:
-            if sibling.name == "dt":
-                break
-            if not authors:
-                authors = [clean(a.get_text(" ", strip=True)) for a in sibling.select("form.authsearch a, a[onclick*='authsearch']") if clean(a.get_text(" ", strip=True))]
-            for anchor in sibling.find_all("a", href=True):
-                if re.search(r"\.pdf(?:$|[?#])", str(anchor.get("href")), re.I):
-                    pdf_url = urljoin(list_url, str(anchor.get("href")))
-                    break
-        rows.append({"title": title, "abstract": "", "authors": authors, "published": f"{year}-01-01", "year": year, "url": detail_url, "pdf_url": pdf_url, "venue": venue, "categories": [], "identifiers": {}, "metadata": {"official_index": list_url}})
-    selected = _selected_rows(spec, rows)
-    _enrich_all(selected, worker_count=_detail_workers(spec))
-    return _finish_rows(spec, selected, adapter="cvf_openaccess", requests=[receipt(response)], proof="official_cvf_index_exhausted_and_all_details_enriched", discovered_count=len(rows))
-
-
-def _parse_ijcai_accepted(html_text: str, *, year: int, page_url: str) -> list[dict[str, Any]]:
-    """Parse the current-year IJCAI accepted-paper feed.
-
-    IJCAI publishes this page before the numbered proceedings directory exists.
-    It is therefore a first-class live metadata channel, not evidence that the
-    year is unavailable.
-    """
-    soup = BeautifulSoup(html_text, "html.parser")
-    rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for node in soup.select(".ij-paper"):
-        title_node = node.select_one(".ij-ptitle")
-        title = clean(title_node.get_text(" ", strip=True) if title_node else "")
-        if not looks_like_title(title) or title_key(title) in seen:
-            continue
-        seen.add(title_key(title))
-        paper_id_node = node.select_one(".ij-pid")
-        paper_id = clean(paper_id_node.get_text(" ", strip=True) if paper_id_node else "").lstrip("#")
-        authors = [clean(author.get_text(" ", strip=True)) for author in node.select(".ij-author")]
-        if len(authors) == 1:
-            authors = [clean(part) for part in re.split(r"\s*(?:,|;|\band\b)\s*", authors[0]) if clean(part)]
-        abstract_node = node.select_one(".ij-abstract")
-        abstract = clean(abstract_node.get_text(" ", strip=True) if abstract_node else "")
-        categories = []
-        for category in node.select(".ij-kw"):
-            value = clean(category.get_text(" ", strip=True))
-            if value and value not in categories:
-                categories.append(value)
-        anchor = f"#paper-{paper_id}" if paper_id else ""
-        rows.append({
-            "title": title,
-            "abstract": abstract,
-            "authors": authors,
-            "published": f"{year}-01-01",
-            "year": year,
-            "url": page_url + anchor,
-            "pdf_url": "",
-            "venue": "IJCAI",
-            "categories": categories,
-            "identifiers": {"ijcai_paper_id": paper_id},
-            "metadata": {"official_accepted_papers_page": page_url},
-        })
-    return rows
-
-
-def fetch_ijcai(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    year = int(spec["years"][0])
-    list_url = f"https://www.ijcai.org/proceedings/{year}/"
-    requests: list[dict[str, Any]] = []
-    response = get(list_url, timeout=60)
-    requests.append(receipt(response))
-    soup = BeautifulSoup(response.text, "html.parser") if response.ok else BeautifulSoup("", "html.parser")
-    rows = []
-    for wrapper in soup.select("div.paper_wrapper"):
-        title_node = wrapper.select_one(".title")
-        title = clean(title_node.get_text(" ", strip=True) if title_node else "")
-        if not looks_like_title(title):
-            continue
-        authors_node = wrapper.select_one(".authors")
-        detail = wrapper.select_one("a[href*='/proceedings/'][href]")
-        pdf = wrapper.find("a", string=re.compile("pdf", re.I))
-        detail_url = urljoin(list_url, str(detail.get("href"))) if detail else ""
-        rows.append({"title": title, "abstract": "", "authors": [clean(authors_node.get_text(" ", strip=True))] if authors_node else [], "published": f"{year}-01-01", "year": year, "url": detail_url, "pdf_url": urljoin(list_url, str(pdf.get("href"))) if pdf else "", "venue": "IJCAI", "categories": [], "identifiers": {}, "metadata": {"official_index": list_url}})
-    if rows:
-        selected = _selected_rows(spec, rows)
-        _enrich_all(selected, worker_count=_detail_workers(spec))
-        return _finish_rows(spec, selected, adapter="ijcai_proceedings", requests=requests, proof="official_ijcai_index_exhausted_and_all_details_enriched", discovered_count=len(rows))
-
-    accepted_url = f"https://{year}.ijcai.org/accepted-papers/"
-    accepted_response = _response(accepted_url)
-    requests.append(receipt(accepted_response))
-    rows = _parse_ijcai_accepted(accepted_response.text, year=year, page_url=accepted_url)
-    discovered_count = len(rows)
-    rows = _selected_rows(spec, rows)
-    for row in rows:
-        if not clean(row.get("abstract")):
-            _indexed_enrich(row)
-    return _finish_rows(spec, rows, adapter="ijcai_accepted_papers", requests=requests, proof="official_ijcai_accepted_papers_page_exhausted", discovered_count=discovered_count)
-
-
-def fetch_eccv(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    year = int(spec["years"][0])
-    if year % 2:
-        raise ValueError("ECCV is held in even-numbered years")
-    list_url = f"https://eccv.ecva.net/virtual/{year}/papers.html"
-    response = _response(list_url)
-    soup = BeautifulSoup(response.text, "html.parser")
-    rows = []
-    seen = set()
-    for anchor in soup.find_all("a", href=True):
-        href = str(anchor.get("href") or "")
-        title = clean(anchor.get_text(" ", strip=True))
-        url = urljoin(list_url, href)
-        if not looks_like_title(title) or not ("/poster/" in href or "/paper/" in href) or url in seen:
-            continue
-        seen.add(url)
-        rows.append({"title": title, "abstract": "", "authors": [], "published": f"{year}-01-01", "year": year, "url": url, "pdf_url": "", "venue": "ECCV", "categories": [], "identifiers": {}, "metadata": {"official_index": list_url}})
-    selected = _selected_rows(spec, rows)
-    _enrich_all(selected, worker_count=_detail_workers(spec))
-    openreview_stats: dict[str, Any] = {}
-    if not _probe_limit(spec) and any(not clean(row.get("abstract")) for row in selected):
-        selected, openreview_stats = _batch_openreview_title_enrich(selected)
-    result_rows, details = _finish_rows(
-        spec,
-        selected,
-        adapter="eccv_virtual",
-        requests=[receipt(response)],
-        proof="official_ecva_index_exhausted_and_all_details_enriched",
-        discovered_count=len(rows),
-    )
-    if openreview_stats:
-        details["openreview_title_enrichment"] = openreview_stats
-    return result_rows, details
-
-
-def _aaai_issue_links(year: int) -> tuple[list[tuple[str, str]], list[dict[str, Any]]]:
-    archive = "https://ojs.aaai.org/index.php/AAAI/issue/archive"
-    links: list[tuple[str, str]] = []
-    receipts: list[dict[str, Any]] = []
-    page = 1
-    while page <= 20:
-        response = _response(archive if page == 1 else f"{archive}/{page}")
-        receipts.append(receipt(response))
-        soup = BeautifulSoup(response.text, "html.parser")
-        found = 0
-        for anchor in soup.select("a.title[href], .obj_issue_summary a[href], a[href*='/issue/view/']"):
-            label = clean(anchor.get_text(" ", strip=True))
-            context = clean(anchor.parent.get_text(" ", strip=True) if anchor.parent else label)
-            if str(year) not in f"{label} {context}":
-                continue
-            url = urljoin(response.url, str(anchor.get("href")))
-            pair = (label or str(year), url)
-            if pair not in links:
-                links.append(pair)
-                found += 1
-        if links and not found:
-            break
-        next_node = soup.select_one("a.next[href]")
-        if not next_node:
-            break
-        page += 1
-    return links, receipts
-
-
-def fetch_aaai(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    year = int(spec["years"][0])
-    probe_limit = _probe_limit(spec)
-    issues, requests = _aaai_issue_links(year)
-    if not issues:
-        raise RuntimeError(f"AAAI OJS has no published issue for {year}")
-    rows = []
-    seen = set()
-    for issue_label, issue_url in issues:
-        response = _response(issue_url)
-        requests.append(receipt(response))
-        soup = BeautifulSoup(response.text, "html.parser")
-        for article in soup.select(".obj_article_summary"):
-            anchor = article.select_one("h3.title a[href], .title a[href]")
-            title = clean(anchor.get_text(" ", strip=True) if anchor else "")
-            url = urljoin(issue_url, str(anchor.get("href"))) if anchor else ""
-            if not looks_like_title(title) or title_key(title) in seen:
-                continue
-            seen.add(title_key(title))
-            authors_node = article.select_one(".authors")
-            rows.append({"title": title, "abstract": "", "authors": [clean(authors_node.get_text(" ", strip=True))] if authors_node else [], "published": f"{year}-01-01", "year": year, "url": url, "pdf_url": "", "venue": "AAAI", "categories": [], "identifiers": {}, "metadata": {"aaai_issue": issue_label, "official_issue_url": issue_url}})
-        # A probe needs only enough real article rows to validate the detail
-        # channel. Do not walk all 40–50 annual OJS issue pages before taking
-        # the diagnostic sample; formal acquisition still exhausts every issue.
-        if probe_limit and len(rows) >= probe_limit:
-            break
-    selected = _selected_rows(spec, rows)
-    _enrich_all(selected, worker_count=_detail_workers(spec))
-    return _finish_rows(spec, selected, adapter="aaai_ojs", requests=requests, proof="official_aaai_ojs_issues_exhausted_and_all_details_enriched", discovered_count=len(rows))
+    return _result(rows, adapter=adapter, requests=requests, proof=proof)
 
 
 def _openalex_abstract(index: Any) -> str:
@@ -621,6 +360,42 @@ def _indexed_enrich_once(row: dict[str, Any], *, allow_remote_arxiv: bool = True
                         break
         except Exception as exc:
             attempts.append({"source": "semantic_scholar_title_for_acm", "error": str(exc)[:300]})
+    if not clean(row.get("abstract")) and cooldown_remaining("openreview") <= 0:
+        try:
+            response = get(
+                "https://api2.openreview.net/notes/search",
+                params={"term": clean(row.get("title")).rstrip("."), "content": "title", "limit": 10},
+                timeout=30,
+            )
+            attempts.append({"source": "openreview_exact_title_for_acm", **receipt(response)})
+            if response.ok:
+                expected_authors = {title_key(value) for value in row.get("authors") or [] if title_key(value)}
+                expected_doi = clean((row.get("identifiers") or {}).get("doi")).lower()
+                for note in response.json().get("notes") or []:
+                    content = note.get("content") if isinstance(note, dict) and isinstance(note.get("content"), dict) else {}
+                    value = lambda item: item.get("value") if isinstance(item, dict) and "value" in item else item
+                    if title_key(value(content.get("title"))) != title_key(row.get("title")):
+                        continue
+                    abstract = clean(value(content.get("abstract")))
+                    candidate_doi = clean(value(content.get("doi"))).lower()
+                    candidate_authors = {
+                        title_key(author)
+                        for author in (value(content.get("authors")) or [])
+                        if title_key(author)
+                    }
+                    if (
+                        len(abstract) < 80
+                        or expected_doi and candidate_doi and expected_doi != candidate_doi
+                        or expected_authors and candidate_authors and expected_authors.isdisjoint(candidate_authors)
+                    ):
+                        continue
+                    row["abstract"] = abstract
+                    note_id = clean(note.get("id"))
+                    if note_id:
+                        row["pdf_url"] = clean(row.get("pdf_url")) or f"https://openreview.net/pdf?id={note_id}"
+                    break
+        except Exception as exc:
+            attempts.append({"source": "openreview_exact_title_for_acm", "error": str(exc)[:300]})
     if not clean(row.get("abstract")):
         try:
             response = get("https://api.archives-ouvertes.fr/search/", params={"q": f'title_t:\"{clean(row.get("title"))}\"', "fl": "title_s,abstract_s,doiId_s,fileMain_s,uri_s", "rows": 5, "wt": "json"}, timeout=45)
@@ -648,7 +423,14 @@ def _indexed_enrich_once(row: dict[str, Any], *, allow_remote_arxiv: bool = True
         attempts.append({"source": "indexed_oa_pdf_for_acm", "status": "abstract_extracted" if abstract else "no_abstract_extracted"})
         if abstract:
             row["abstract"] = abstract
-    if not clean(row.get("abstract")) and allow_remote_arxiv and cooldown_remaining("arxiv") <= 0:
+    recent_arxiv_miss = (
+        float(row.get("metadata", {}).get("checkpoint_mtime") or 0) >= time.time() - 86400
+        and any(
+            item.get("source") == "arxiv_title_match_for_acm" and item.get("status_code") == 200
+            for item in attempts if isinstance(item, dict)
+        )
+    )
+    if not clean(row.get("abstract")) and allow_remote_arxiv and not recent_arxiv_miss and cooldown_remaining("arxiv") <= 0:
         try:
             response = get("https://export.arxiv.org/api/query", params={"search_query": f'ti:\"{clean(row.get("title"))}\"', "start": 0, "max_results": 5}, timeout=90)
             attempts.append({"source": "arxiv_title_match_for_acm", **receipt(response)})
@@ -666,8 +448,8 @@ def _indexed_enrich_once(row: dict[str, Any], *, allow_remote_arxiv: bool = True
                     break
         except Exception as exc:
             attempts.append({"source": "arxiv_title_match_for_acm", "error": str(exc)[:300]})
-    elif not clean(row.get("abstract")) and not allow_remote_arxiv:
-        attempts.append({"source": "arxiv_title_match_for_acm", "status": "skipped_run_request_budget"})
+    elif not clean(row.get("abstract")) and recent_arxiv_miss:
+        attempts.append({"source": "arxiv_title_match_for_acm", "status": "skipped_recent_exact_title_miss"})
     return row
 
 
@@ -721,7 +503,8 @@ def _acm_checkpoint_path(venue_id: str, year: int, row: dict[str, Any]):
 def _restore_acm_checkpoints(venue_id: str, year: int, rows: list[dict[str, Any]]) -> int:
     restored = 0
     for row in rows:
-        payload = read_json(_acm_checkpoint_path(venue_id, year, row), {})
+        checkpoint_path = _acm_checkpoint_path(venue_id, year, row)
+        payload = read_json(checkpoint_path, {})
         saved = payload.get("paper") if isinstance(payload, dict) else None
         if not isinstance(saved, dict) or title_key(saved.get("title")) != title_key(row.get("title")):
             continue
@@ -733,6 +516,8 @@ def _restore_acm_checkpoints(venue_id: str, year: int, rows: list[dict[str, Any]
             row.setdefault("metadata", {})["indexed_enrichment"] = saved_metadata["indexed_enrichment"]
         if saved_metadata.get("openaire_repository_urls"):
             row.setdefault("metadata", {})["openaire_repository_urls"] = saved_metadata["openaire_repository_urls"]
+        if checkpoint_path.is_file():
+            row.setdefault("metadata", {})["checkpoint_mtime"] = checkpoint_path.stat().st_mtime
         if clean(row.get("abstract")):
             restored += 1
     return restored
@@ -862,83 +647,6 @@ def _batch_semantic_scholar_enrich(rows: list[dict[str, Any]]) -> list[dict[str,
         except Exception:
             continue
     return rows
-
-
-def _batch_openreview_title_enrich(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Recover exact-title public manuscripts indexed by OpenReview search.
-
-    Current ACM proceedings often appear in OpenReview's public manuscript
-    index before OpenAlex/S2 ingest the DOI.  Search is URL discovery only:
-    accept an abstract when the normalized title is exact, any supplied DOI
-    agrees, and at least one author agrees when both sides expose authors.
-    """
-    targets = [row for row in rows if not clean(row.get("abstract")) and title_key(row.get("title"))]
-    stats = {
-        "source": "openreview_exact_title_for_acm",
-        "attempted": 0,
-        "abstracts_filled": 0,
-        "identity_mismatches": 0,
-        "errors": [],
-    }
-
-    def value(item: Any) -> Any:
-        return item.get("value") if isinstance(item, dict) and "value" in item else item
-
-    def author_keys(item: Any) -> set[str]:
-        values = item if isinstance(item, list) else [item]
-        return {title_key(value(entry)) for entry in values if title_key(value(entry))}
-
-    for row in targets:
-        stats["attempted"] += 1
-        try:
-            response = get(
-                "https://api2.openreview.net/notes/search",
-                params={"term": clean(row.get("title")).rstrip("."), "content": "title", "limit": 10},
-                timeout=45,
-            )
-            if not response.ok:
-                continue
-            expected_doi = clean((row.get("identifiers") or {}).get("doi")).lower()
-            expected_authors = author_keys(row.get("authors"))
-            accepted = False
-            for note in response.json().get("notes") or []:
-                if not isinstance(note, dict):
-                    continue
-                content = note.get("content") if isinstance(note.get("content"), dict) else {}
-                if title_key(value(content.get("title"))) != title_key(row.get("title")):
-                    continue
-                abstract = clean(value(content.get("abstract")))
-                if len(abstract) < 80:
-                    continue
-                candidate_doi = clean(value(content.get("doi"))).lower()
-                if expected_doi and candidate_doi and candidate_doi != expected_doi:
-                    stats["identity_mismatches"] += 1
-                    continue
-                candidate_authors = author_keys(value(content.get("authors")))
-                if expected_authors and candidate_authors and expected_authors.isdisjoint(candidate_authors):
-                    stats["identity_mismatches"] += 1
-                    continue
-                note_id = clean(note.get("id"))
-                row["abstract"] = abstract
-                if note_id:
-                    row["pdf_url"] = clean(row.get("pdf_url")) or f"https://openreview.net/pdf?id={note_id}"
-                row.setdefault("metadata", {}).setdefault("indexed_enrichment", []).append({
-                    "source": "openreview_exact_title_for_acm",
-                    "openreview_id": note_id,
-                    **receipt(response),
-                })
-                stats["abstracts_filled"] += 1
-                accepted = True
-                break
-            if not accepted:
-                stats["identity_mismatches"] += 1
-        except Exception as exc:
-            stats["errors"].append(f"{type(exc).__name__}: {str(exc)[:240]}")
-        # Anonymous OpenReview search advertises 20 requests/minute.  Keep this
-        # fallback below that ceiling even when no Retry-After is supplied.
-        time.sleep(3.1)
-    stats["errors"] = stats["errors"][:10]
-    return rows, stats
 
 
 def _openaire_values(value: Any) -> list[str]:
@@ -1722,9 +1430,8 @@ def fetch_acm_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[st
             row.setdefault("metadata", {})["official_title_pool_observed"] = title_key(row.get("title")) in official_keys
     discovered_count = len(rows)
     rows = _selected_rows(spec, rows)
-    probe_only = bool(_probe_limit(spec))
-    restored_partial_metadata = 0 if probe_only else _restore_acm_partial_metadata(venue_id, year, rows)
-    restored_checkpoints = 0 if probe_only else _restore_acm_checkpoints(venue_id, year, rows)
+    restored_partial_metadata = _restore_acm_partial_metadata(venue_id, year, rows)
+    restored_checkpoints = _restore_acm_checkpoints(venue_id, year, rows)
     _batch_local_arxiv_enrich(rows)
     # TASTE permits indexed abstract enrichment for ACM venues, but never accepts
     # the DBLP title seed by itself as a verified cache.
@@ -1736,40 +1443,44 @@ def fetch_acm_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[st
     # of requests.  Run that high-yield exact-title source before OpenAIRE's
     # five-title search so one conference cannot consume the anonymous
     # 60-request hourly allowance on records the venue page already contains.
-    rows, openreview_search_stats = _batch_openreview_title_enrich(rows)
     _batch_openaire_title_enrich(rows)
-    if not probe_only:
-        for row in rows:
-            if clean(row.get("abstract")) or clean(row.get("pdf_url")) or (row.get("metadata") or {}).get("openaire_repository_urls"):
-                _save_acm_checkpoint(venue_id, year, row)
-        _write_acm_progress(venue_id, year, rows, "batch_index_enrichment")
+    for row in rows:
+        _save_acm_checkpoint(venue_id, year, row)
+    _write_acm_progress(venue_id, year, rows, "batch_index_enrichment")
     missing_rows = [row for row in rows if not clean(row.get("abstract"))]
-    # ACM often challenges automated clients.  Probe serially and stop at the
-    # first persisted cooldown so queued workers cannot each wait 60 seconds.
+    # ACM often challenges automated clients. Stop at the first persisted
+    # cooldown so queued requests cannot each wait through the same window.
     for row in list(missing_rows):
         if cooldown_remaining("acm") > 0:
             break
         _try_acm_pdf_abstract(row)
-        if not probe_only:
-            _save_acm_checkpoint(venue_id, year, row)
-            _write_acm_progress(venue_id, year, rows, "acm_pdf_enrichment")
+        _save_acm_checkpoint(venue_id, year, row)
+        _write_acm_progress(venue_id, year, rows, "acm_pdf_enrichment")
     missing_rows = [row for row in rows if not clean(row.get("abstract"))]
     # A long OpenAlex/OpenAIRE cooldown must not abort the source while other
     # independent exact-identity routes (Semantic Scholar, HAL, arXiv, public
     # PDFs) remain usable.  Each fallback below checks its own channel budget
     # and skips only the unavailable service, so continuing is bounded and
     # resumable rather than expanding the cooled-down request queue.
-    try:
-        arxiv_budget = max(0, int(os.environ.get("RECOMMEND_PAPERS_ACM_ARXIV_FALLBACK_BUDGET", "12")))
-    except ValueError:
-        arxiv_budget = 12
     arxiv_attempts = 0
-    for row in missing_rows:
-        before = sum(item.get("source") == "arxiv_title_match_for_acm" for item in row.setdefault("metadata", {}).setdefault("indexed_enrichment", []))
-        _indexed_enrich(row, allow_remote_arxiv=probe_only or arxiv_attempts < arxiv_budget)
-        after = sum(item.get("source") == "arxiv_title_match_for_acm" and item.get("status") != "skipped_run_request_budget" for item in row["metadata"]["indexed_enrichment"])
-        arxiv_attempts += max(0, after - before)
-        if not probe_only:
+    before_by_title = {
+        title_key(row.get("title")): sum(
+            item.get("source") == "arxiv_title_match_for_acm"
+            for item in row.setdefault("metadata", {}).setdefault("indexed_enrichment", [])
+        )
+        for row in missing_rows
+    }
+    with ThreadPoolExecutor(max_workers=max(1, min(8, len(missing_rows)))) as pool:
+        futures = {pool.submit(_indexed_enrich, row, allow_remote_arxiv=True): row for row in missing_rows}
+        for future in as_completed(futures):
+            row = futures[future]
+            future.result()
+            after = sum(
+                item.get("source") == "arxiv_title_match_for_acm"
+                and item.get("status") != "skipped_run_request_budget"
+                for item in row["metadata"]["indexed_enrichment"]
+            )
+            arxiv_attempts += max(0, after - before_by_title[title_key(row.get("title"))])
             _save_acm_checkpoint(venue_id, year, row)
             _write_acm_progress(venue_id, year, rows, "indexed_fallback_enrichment")
     if sigir_program_rows:
@@ -1789,14 +1500,12 @@ def fetch_acm_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[st
         "dblp_seed_count": discovered_count - max(0, len([row for row in official_rows if title_key(row.get('title')) not in seen])),
         "restored_checkpoints": restored_checkpoints,
         "restored_partial_metadata_rows": restored_partial_metadata,
-        "checkpoint_mode": "disabled_for_probe" if probe_only else "per_paper_resumable",
+        "checkpoint_mode": "per_paper_resumable",
         "chatpaper_abstract_enrichment": chatpaper_stats,
-        "openreview_title_enrichment": openreview_search_stats,
         "remote_arxiv_fallback_attempts": arxiv_attempts,
-        "remote_arxiv_fallback_budget": None if probe_only else arxiv_budget,
+        "remote_arxiv_fallback_coverage": "all_remaining_rows",
     })
-    if not probe_only:
-        stage_dir = _acm_stage_dir(venue_id, year)
-        if stage_dir.is_dir():
-            shutil.rmtree(stage_dir)
+    stage_dir = _acm_stage_dir(venue_id, year)
+    if stage_dir.is_dir():
+        shutil.rmtree(stage_dir)
     return result_rows, details

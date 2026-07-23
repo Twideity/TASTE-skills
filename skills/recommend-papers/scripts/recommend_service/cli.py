@@ -6,20 +6,16 @@ import json
 import os
 import sys
 import tempfile
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from . import __version__
 from .credentials import openreview_settings
 from .claude_reads import claude_status, run_claude_reads
-from .metadata import catalog, clean, metadata_cache_inventory, migrate_metadata_caches, probe_venue
+from .metadata import catalog, clean, metadata_cache_inventory, migrate_metadata_caches
 from .pipeline import build_random_venue_shortlist, build_shortlist, complete, finalize, finish_stage, replace_failed_random_venue_papers, run_fulltext, run_metadata
 from .reading_artifacts import prepare_fast_batches, prepare_reads, validate_reads
 from .storage import CACHE_ROOT, RUNS_ROOT, STATE_ROOT, create_run, git_root_for, read_json, require_run, write_json
-
-
-PROBE_DIAGNOSTIC_SAMPLE_LIMIT = 3
 
 
 def _command_exit_code(command: str, result: dict[str, Any]) -> int:
@@ -30,7 +26,6 @@ def _command_exit_code(command: str, result: dict[str, Any]) -> int:
         "cache-status": {"ok"},
         "migrate-metadata-cache": {"complete"},
         "init-run": {"initialized"},
-        "probe-venue": {"probe_available"},
         "metadata": {"complete"},
         "random-venue-shortlist": {"complete"},
         "replace-failed-random-venue": {"complete"},
@@ -44,7 +39,7 @@ def _command_exit_code(command: str, result: dict[str, Any]) -> int:
     }
     if command in accepted:
         return 0 if status in accepted[command] else 2
-    return 2 if status in {"error", "blocked", "probe_error", "temporarily_unresolved", "unavailable"} else 0
+    return 2 if status in {"error", "blocked", "temporarily_unresolved", "unavailable"} else 0
 
 
 def initialize_run(*, parent_run_dir: Path | None = None, mode: str = "", question: str = "") -> dict[str, Any]:
@@ -226,14 +221,6 @@ def _execute(args: argparse.Namespace) -> dict[str, Any]:
         return initialize_run(parent_run_dir=args.parent_run_dir, mode=args.mode, question=args.question)
     if args.command == "catalog":
         return catalog(args.query)
-    if args.command == "probe-venue":
-        return probe_venue(
-            {"type": "venue", "venue_id": args.venue_id, "venue": args.venue, "adapter": args.adapter, "openreview_venue_id": args.openreview_venue_id},
-            args.start_year,
-            args.lookback,
-            PROBE_DIAGNOSTIC_SAMPLE_LIMIT,
-            args.run_dir,
-        )
     if args.command == "metadata":
         return _compact_metadata_result(run_metadata(args.plan.resolve(), args.run_dir))
     if args.command == "shortlist":
@@ -276,14 +263,6 @@ def main(argv: list[str] | None = None) -> int:
     initialize.add_argument("--question", default="")
     cat = sub.add_parser("catalog")
     cat.add_argument("--query", default="")
-    probe = sub.add_parser("probe-venue")
-    probe.add_argument("--venue-id", default="")
-    probe.add_argument("--venue", default="")
-    probe.add_argument("--adapter", choices=["dblp", "openreview", "neurips_official", "icml_official", "acm_enriched", "aaai_ojs", "cvf_openaccess", "acl_anthology", "ijcai_proceedings", "eccv_virtual"], default="")
-    probe.add_argument("--openreview-venue-id", default="")
-    probe.add_argument("--start-year", type=int, default=datetime.now().year)
-    probe.add_argument("--lookback", type=int, default=5)
-    probe.add_argument("--run-dir", type=Path, required=True)
     meta = sub.add_parser("metadata")
     meta.add_argument("--plan", type=Path, required=True)
     meta.add_argument("--run-dir", type=Path, required=True)

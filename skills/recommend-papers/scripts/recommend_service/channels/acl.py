@@ -4,14 +4,13 @@ import re
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
-from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
 from .base import Channel
 from .conference_common import complete_abstract_catalog
-from .runtime import clean, finish, probe_limit
-from .shared import explicit_pdf, values_blob
+from .runtime import clean, finish
+from .shared import acl_pdf_abstract, explicit_pdf, values_blob
 from ..http import get, receipt
 
 ID = "acl"
@@ -25,6 +24,8 @@ def _detail(row: dict[str, Any]) -> None:
     node = soup.select_one("#abstract, .card-body.acl-abstract, div.acl-abstract")
     if node:
         row["abstract"] = re.sub(r"^abstract\s*[:—-]?\s*", "", clean(node.get_text(" ", strip=True)), flags=re.I)
+    if not clean(row.get("abstract")):
+        acl_pdf_abstract(row)
     row.setdefault("metadata", {})["detail_receipt"] = receipt(response)
 
 
@@ -55,12 +56,10 @@ def fetch_metadata(spec):
             abstract_node = node.find("abstract")
             abstract = clean("".join(abstract_node.itertext()) if abstract_node is not None else "")
             rows.append({"title": title, "abstract": abstract, "authors": authors, "published": f"{year}-01-01", "year": year, "url": paper_url, "pdf_url": paper_url.rstrip("/") + ".pdf", "venue": "ACL", "categories": [], "identifiers": {"doi": clean(node.findtext("doi")), "acl_anthology_id": anthology_id}, "metadata": {"official_xml": source_url}})
-    limit = probe_limit(spec)
-    selected = rows[:limit] if limit else rows
-    missing = [row for row in selected if not clean(row.get("abstract"))]
-    with ThreadPoolExecutor(max_workers=max(1, min(3 if limit else 8, len(missing)))) as pool:
+    missing = [row for row in rows if not clean(row.get("abstract"))]
+    with ThreadPoolExecutor(max_workers=max(1, min(8, len(missing)))) as pool:
         list(pool.map(_detail, missing))
-    return finish(spec, selected, adapter="acl_anthology", requests=[receipt(response)], proof="official_acl_anthology_xml_exhausted_and_all_abstracts_present", discovered_count=len(rows))
+    return finish(spec, rows, adapter="acl_anthology", requests=[receipt(response)], proof="official_acl_anthology_xml_exhausted_and_all_abstracts_present", discovered_count=len(rows))
 
 
 def pdf_candidates(paper: dict[str, Any]):

@@ -48,17 +48,16 @@ class Channel:
         self, spec: dict[str, Any]
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         rows, receipt = self.metadata_fetcher(spec)
-        if not spec.get("_probe_limit"):
-            years = [int(value) for value in spec.get("years") or []]
-            receipt = dict(receipt)
-            receipt.update({
-                "requested_years": years,
-                "effective_years": years,
-                "year_fallback": False,
-                "year_fallback_reason": "",
-                "channel": self.id,
-                "channel_metadata_workers": self.metadata_workers,
-            })
+        years = [int(value) for value in spec.get("years") or []]
+        receipt = dict(receipt)
+        receipt.update({
+            "requested_years": years,
+            "effective_years": years,
+            "year_fallback": False,
+            "year_fallback_reason": "",
+            "channel": self.id,
+            "channel_metadata_workers": self.metadata_workers,
+        })
         return rows, receipt
 
     def pdf_candidates(self, paper: dict[str, Any]) -> list[dict[str, str]]:

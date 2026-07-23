@@ -277,7 +277,7 @@ def _policy_remaining(policy: dict[str, float | int | None]) -> float | None:
 
 @contextmanager
 def bounded_request_policy(*, max_attempts: int, max_wait_seconds: float, wall_timeout_seconds: float = 30.0) -> Iterator[None]:
-    """Bound retries/cooldown waits for lightweight availability probes only."""
+    """Bound retries, cooldown waits, and total time for optional fallbacks."""
     current = _request_policy.get()
     requested_deadline = time.monotonic() + max(0.1, float(wall_timeout_seconds))
     token = _request_policy.set({

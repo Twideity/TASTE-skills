@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from .channels.registry import canonical as canonical_channel
 from .fulltext import acquire_many
 from .metadata import clean, deduplicate, fetch_source, migrate_metadata_caches, paper_identity, validate_plan
 from .reading_artifacts import READ_CONTRACT_VERSION
@@ -60,19 +61,6 @@ def run_metadata(plan_path: Path, run_dir: Path | None = None) -> dict[str, Any]
         return _run_metadata_locked(plan_path, directory)
 
 
-def _venue_key(value: Any) -> str:
-    key = "".join(character for character in clean(value).lower() if character.isalnum())
-    aliases = {
-        "sigkdd": "kdd",
-        "nips": "neurips",
-        "thewebconference": "www",
-        "thewebconf": "www",
-        "webconference": "www",
-        "webconf": "www",
-    }
-    return aliases.get(key, key)
-
-
 def _source_field_coverage(papers: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(papers)
     counts = {
@@ -116,48 +104,6 @@ def _metadata_coverage_notices(receipts: list[dict[str, Any]]) -> list[dict[str,
     return notices
 
 
-def _require_venue_probe_receipts(plan: dict[str, Any], directory: Path) -> list[dict[str, Any]]:
-    receipts = []
-    for path in sorted((directory / "venue_probes").glob("*.json")):
-        payload = read_json(path, {})
-        if isinstance(payload, dict):
-            receipts.append((path, payload))
-    proofs: list[dict[str, Any]] = []
-    for index, source in enumerate(plan.get("sources") or []):
-        if clean(source.get("type")).lower() != "venue":
-            continue
-        venue = _venue_key(source.get("venue_id") or source.get("venue"))
-        year = int((source.get("years") or [0])[0])
-        match = next((
-            (path, payload)
-            for path, payload in reversed(receipts)
-            if payload.get("status") == "probe_available"
-            and payload.get("probe_only") is True
-            and payload.get("research_output") is False
-            and payload.get("complete_catalog") is False
-            and int(payload.get("resolved_year") or 0) == year
-            and _venue_key((payload.get("source") or {}).get("venue_id") or (payload.get("source") or {}).get("venue")) == venue
-        ), None)
-        if match is None:
-            raise ValueError(
-                f"sources[{index}] {venue or 'venue'} {year} lacks a successful diagnostic probe receipt in this run; "
-                "run probe-venue first. Probe samples are never metadata input."
-            )
-        path, payload = match
-        if source.get("latest_usable_year") is True:
-            as_of = clean((plan.get("request_scope") or {}).get("as_of_date"))
-            try:
-                expected_start_year = int(as_of[:4])
-            except (TypeError, ValueError):
-                raise ValueError("latest_usable_year requires request_scope.as_of_date")
-            if int(payload.get("requested_year") or 0) != expected_start_year:
-                raise ValueError(
-                    f"sources[{index}] {venue} claims latest usable year, but its probe did not start at {expected_start_year}"
-                )
-        proofs.append({"venue": venue, "year": year, "receipt_path": str(path), "receipt_fingerprint": stable_hash(payload)})
-    return proofs
-
-
 def _run_metadata_locked(plan_path: Path, directory: Path) -> dict[str, Any]:
     migrate_metadata_caches()
     plan = validate_plan(read_json(plan_path, {}))
@@ -170,7 +116,6 @@ def _run_metadata_locked(plan_path: Path, directory: Path) -> dict[str, Any]:
             raise ValueError(
                 "Child plan violates the inherited conversation-level reading preference: " + ", ".join(mismatched)
             )
-    probe_proofs = _require_venue_probe_receipts(plan, directory)
     write_json(directory / "plan.json", plan)
     policy = clean(plan.get("cache_policy") or "reuse").lower()
     if policy not in {"reuse", "refresh", "only"}:
@@ -247,9 +192,8 @@ def _run_metadata_locked(plan_path: Path, directory: Path) -> dict[str, Any]:
         "generated_at": now_iso(),
         "raw_count": len(all_rows),
         "deduplicated_count": len(papers),
-        "probe_proofs": probe_proofs,
         "plan_fingerprint": stable_hash(plan),
-        "metadata_fingerprint": stable_hash({"plan": plan, "probe_proofs": probe_proofs, "papers": papers}),
+        "metadata_fingerprint": stable_hash({"plan": plan, "papers": papers}),
         "metadata_profile": "full_metadata",
         "coverage_notices": coverage_notices,
         "papers": papers,
@@ -356,7 +300,7 @@ def build_random_venue_shortlist(run_dir: Path, per_venue: int, seed: int | None
     for index, source in enumerate(plan.get("sources") or []):
         if clean(source.get("type")).lower() != "venue":
             raise ValueError("random-venue-shortlist supports venue-only plans")
-        venue = _venue_key(source.get("venue_id") or source.get("venue"))
+        venue = canonical_channel(source.get("venue_id") or source.get("venue"))
         years = source.get("years") or []
         if not venue or len(years) != 1:
             raise ValueError(f"sources[{index}] must identify exactly one venue and year")
@@ -370,7 +314,7 @@ def build_random_venue_shortlist(run_dir: Path, per_venue: int, seed: int | None
         if not isinstance(paper, dict):
             continue
         try:
-            key = (_venue_key(paper.get("venue")), int(paper.get("year") or 0))
+            key = (canonical_channel(paper.get("venue")), int(paper.get("year") or 0))
         except (TypeError, ValueError):
             continue
         if key in candidates:
@@ -469,7 +413,7 @@ def replace_failed_random_venue_papers(run_dir: Path) -> dict[str, Any]:
         if not isinstance(paper, dict):
             continue
         try:
-            key = (_venue_key(paper.get("venue")), int(paper.get("year") or 0))
+            key = (canonical_channel(paper.get("venue")), int(paper.get("year") or 0))
         except (TypeError, ValueError):
             continue
         population.setdefault(key, []).append(paper)
@@ -478,7 +422,7 @@ def replace_failed_random_venue_papers(run_dir: Path) -> dict[str, Any]:
     strata: list[dict[str, Any]] = []
     replacement_count = 0
     for prior in shortlist.get("strata") or []:
-        venue, year = _venue_key(prior.get("venue")), int(prior.get("year") or 0)
+        venue, year = canonical_channel(prior.get("venue")), int(prior.get("year") or 0)
         prior_ids = [clean(value) for value in prior.get("identities") or []]
         kept = [ready[identity] for identity in prior_ids if identity in ready]
         needed = per_venue - len(kept)

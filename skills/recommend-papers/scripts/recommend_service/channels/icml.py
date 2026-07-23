@@ -6,7 +6,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from .base import Channel
 from .conference_common import complete_abstract_catalog
-from .runtime import clean, finish, looks_like_title, probe_limit, response
+from .runtime import clean, finish, looks_like_title, response
 from .shared import explicit_pdf, values_blob
 from ..http import receipt
 ID="icml"; SOURCE="ICML / PMLR / OpenReview"
@@ -33,9 +33,8 @@ def fetch_metadata(spec):
         if not looks_like_title(title) or not any(x in href for x in ("/poster/","/oral/","/paper/","/spotlight/")) or url in seen: continue
         seen.add(url); presentation=next((label for marker,label in (("/oral/","oral"),("/spotlight/","spotlight"),("/poster/","poster")) if marker in href),"paper")
         rows.append({"title":title,"abstract":"","authors":[],"published":f"{year}-01-01","year":year,"url":url,"pdf_url":"","venue":"ICML","categories":[presentation],"presentation_type":presentation,"identifiers":{},"metadata":{"official_index":list_url}})
-    limit=probe_limit(spec); selected=rows[:limit] if limit else rows
-    with ThreadPoolExecutor(max_workers=max(1,min(3 if limit else 16,len(selected)))) as pool:list(pool.map(_detail,selected))
-    return finish(spec,selected,adapter="icml_official_virtual",requests=[receipt(r)],proof="official_icml_virtual_index_exhausted_and_all_details_enriched",discovered_count=len(rows))
+    with ThreadPoolExecutor(max_workers=max(1,min(16,len(rows)))) as pool:list(pool.map(_detail,rows))
+    return finish(spec,rows,adapter="icml_official_virtual",requests=[receipt(r)],proof="official_icml_virtual_index_exhausted_and_all_details_enriched",discovered_count=len(rows))
 
 def pdf_candidates(paper:dict[str,Any]):
     rows=explicit_pdf(paper,"icml_official_pdf",SOURCE)

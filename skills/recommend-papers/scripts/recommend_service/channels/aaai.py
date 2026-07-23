@@ -6,7 +6,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from .base import Channel
 from .conference_common import complete_abstract_catalog
-from .runtime import clean, finish, looks_like_title, probe_limit, response
+from .runtime import clean, finish, looks_like_title, response
 from .shared import explicit_pdf
 from ..http import receipt
 ID="aaai"; SOURCE="AAAI Proceedings"
@@ -32,7 +32,7 @@ def _detail(row):
     if doi: row.setdefault("identifiers",{})["doi"]=clean(doi.get("content"))
     row.setdefault("metadata",{})["detail_receipt"]=receipt(r)
 def fetch_metadata(spec):
-    year=int(spec["years"][0]); limit=probe_limit(spec); issues,requests=_issues(year)
+    year=int(spec["years"][0]); issues,requests=_issues(year)
     if not issues: raise RuntimeError(f"AAAI OJS has no published issue for {year}")
     rows=[]; seen=set()
     for label,url in issues:
@@ -42,9 +42,7 @@ def fetch_metadata(spec):
             if not looks_like_title(title) or _key(title) in seen: continue
             seen.add(_key(title)); authors=article.select_one(".authors")
             rows.append({"title":title,"abstract":"","authors":[clean(authors.get_text(" ",strip=True))] if authors else [],"published":f"{year}-01-01","year":year,"url":detail,"pdf_url":"","venue":"AAAI","categories":[],"identifiers":{},"metadata":{"aaai_issue":label,"official_issue_url":url}})
-        if limit and len(rows)>=limit: break
-    selected=rows[:limit] if limit else rows
-    with ThreadPoolExecutor(max_workers=max(1,min(3 if limit else 8,len(selected)))) as pool:list(pool.map(_detail,selected))
-    return finish(spec,selected,adapter="aaai_ojs",requests=requests,proof="official_aaai_ojs_issues_exhausted_and_all_details_enriched",discovered_count=len(rows))
+    with ThreadPoolExecutor(max_workers=max(1,min(8,len(rows)))) as pool:list(pool.map(_detail,rows))
+    return finish(spec,rows,adapter="aaai_ojs",requests=requests,proof="official_aaai_ojs_issues_exhausted_and_all_details_enriched",discovered_count=len(rows))
 def pdf_candidates(paper:dict[str,Any]): return explicit_pdf(paper,"aaai_ojs_pdf",SOURCE)
 CHANNEL=Channel(ID,"conference",fetch_metadata,2,8,3,SOURCE,complete_abstract_catalog,pdf_candidates)

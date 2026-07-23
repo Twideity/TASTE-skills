@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 
 from .base import Channel
 from .conference_common import complete_abstract_catalog
-from .runtime import clean, finish, looks_like_title, probe_limit, response
+from .runtime import clean, finish, looks_like_title, response
 from .shared import explicit_pdf, values_blob
 from ..http import receipt
 
@@ -78,11 +78,9 @@ def fetch_metadata(spec):
             continue
         seen.add(detail_url)
         rows.append({"title": title, "abstract": "", "authors": [], "published": f"{year}-01-01", "year": year, "url": detail_url, "pdf_url": "", "venue": "NeurIPS", "categories": [], "identifiers": {}, "metadata": {"official_index": list_response.url}})
-    limit = probe_limit(spec)
-    selected = rows[:limit] if limit else rows
-    workers = min(3, limit) if limit else 16
-    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(selected)))) as pool:
-        futures = {pool.submit(_detail, row): row for row in selected}
+    workers = 16
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(rows)))) as pool:
+        futures = {pool.submit(_detail, row): row for row in rows}
         for future in as_completed(futures):
             row = futures[future]
             try:
@@ -90,7 +88,7 @@ def fetch_metadata(spec):
             except Exception as exc:
                 row.setdefault("metadata", {})["detail_error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
     result, details = finish(
-        spec, selected, adapter="neurips_official_papers",
+        spec, rows, adapter="neurips_official_papers",
         requests=[receipt(list_response)],
         proof="official_neurips_proceedings_index_exhausted_and_all_details_enriched",
         discovered_count=len(rows),

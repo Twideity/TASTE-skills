@@ -6,7 +6,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from .base import Channel
 from .conference_common import complete_abstract_catalog
-from .runtime import clean, finish, looks_like_title, probe_limit, response
+from .runtime import clean, finish, looks_like_title, response
 from .shared import explicit_pdf, values_blob
 from ..http import receipt
 ID = "cvpr"; SOURCE = "CVF Open Access"
@@ -29,9 +29,8 @@ def fetch_metadata(spec):
             link=sibling.find("a",href=re.compile(r"\.pdf(?:$|[?#])",re.I))
             if link: pdf=urljoin(list_url,str(link.get("href"))); break
         rows.append({"title":title,"abstract":"","authors":authors,"published":f"{year}-01-01","year":year,"url":url,"pdf_url":pdf,"venue":"CVPR","categories":[],"identifiers":{},"metadata":{"official_index":list_url}})
-    limit=probe_limit(spec); selected=rows[:limit] if limit else rows
-    with ThreadPoolExecutor(max_workers=max(1,min(3 if limit else 8,len(selected)))) as pool: list(pool.map(_detail,selected))
-    return finish(spec,selected,adapter="cvf_openaccess",requests=[receipt(r)],proof="official_cvf_index_exhausted_and_all_details_enriched",discovered_count=len(rows))
+    with ThreadPoolExecutor(max_workers=max(1,min(8,len(rows)))) as pool: list(pool.map(_detail,rows))
+    return finish(spec,rows,adapter="cvf_openaccess",requests=[receipt(r)],proof="official_cvf_index_exhausted_and_all_details_enriched",discovered_count=len(rows))
 
 def pdf_candidates(paper: dict[str,Any]):
     rows=explicit_pdf(paper,"cvpr_cvf_pdf",SOURCE)

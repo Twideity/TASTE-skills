@@ -8,7 +8,14 @@ CONFERENCE_IDS = (
     "neurips", "iclr", "icml", "kdd", "sigir", "cikm", "aaai",
     "iccv", "www", "cvpr", "acl", "ijcai", "eccv", "emnlp",
 )
-ALIASES = {"nips": "neurips", "sigkdd": "kdd", "thewebconference": "www"}
+ALIASES = {
+    "nips": "neurips",
+    "sigkdd": "kdd",
+    "thewebconference": "www",
+    "thewebconf": "www",
+    "webconference": "www",
+    "webconf": "www",
+}
 ALL_IDS = (*CONFERENCE_IDS, "arxiv", "biorxiv")
 
 

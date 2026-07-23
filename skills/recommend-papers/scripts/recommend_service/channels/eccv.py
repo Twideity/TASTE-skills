@@ -6,7 +6,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from .base import Channel
 from .conference_common import complete_abstract_catalog
-from .runtime import clean, finish, looks_like_title, probe_limit, response
+from .runtime import clean, finish, looks_like_title, response
 from .shared import explicit_pdf, values_blob
 from ..http import receipt
 ID="eccv"; SOURCE="ECVA"
@@ -29,9 +29,8 @@ def fetch_metadata(spec):
         href=str(a.get("href") or ""); title=clean(a.get_text(" ",strip=True)); url=urljoin(list_url,href)
         if not looks_like_title(title) or not ("/poster/" in href or "/paper/" in href) or url in seen:continue
         seen.add(url); rows.append({"title":title,"abstract":"","authors":[],"published":f"{year}-01-01","year":year,"url":url,"pdf_url":"","venue":"ECCV","categories":[],"identifiers":{},"metadata":{"official_index":list_url}})
-    limit=probe_limit(spec); selected=rows[:limit] if limit else rows
-    with ThreadPoolExecutor(max_workers=max(1,min(3 if limit else 16,len(selected)))) as pool:list(pool.map(_detail,selected))
-    return finish(spec,selected,adapter="eccv_virtual",requests=[receipt(r)],proof="official_ecva_index_exhausted_and_all_details_enriched",discovered_count=len(rows))
+    with ThreadPoolExecutor(max_workers=max(1,min(16,len(rows)))) as pool:list(pool.map(_detail,rows))
+    return finish(spec,rows,adapter="eccv_virtual",requests=[receipt(r)],proof="official_ecva_index_exhausted_and_all_details_enriched",discovered_count=len(rows))
 def pdf_candidates(paper:dict[str,Any]):
     rows=explicit_pdf(paper,"eccv_ecva_pdf",SOURCE)
     for year,pid,page_year in re.findall(r"ecva\.net/papers/eccv_(\d{4})/papers_ECCV/html/(\d+)_ECCV_(\d{4})_paper\.php",values_blob(paper),re.I):
