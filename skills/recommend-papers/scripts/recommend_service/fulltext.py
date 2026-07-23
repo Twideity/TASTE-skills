@@ -29,6 +29,16 @@ _openreview_client_lock = threading.Lock()
 _openreview_client_cache: dict[tuple[str, str], tuple[Any, dict[str, Any]]] = {}
 
 
+def _openalex_params() -> dict[str, str]:
+    api_key = clean(os.environ.get("OPENALEX_API_KEY"))
+    return {"api_key": api_key} if api_key else {}
+
+
+def _semantic_scholar_headers() -> dict[str, str]:
+    api_key = clean(os.environ.get("SEMANTIC_SCHOLAR_API_KEY") or os.environ.get("S2_API_KEY"))
+    return {"x-api-key": api_key} if api_key else {}
+
+
 def _title_tokens(value: Any) -> set[str]:
     stop = {"a", "an", "and", "for", "in", "of", "on", "the", "to", "toward", "towards", "with", "via", "using"}
     normalized = re.sub(r"[\u2010-\u2015]", "-", clean(value))
@@ -297,7 +307,10 @@ def _candidate_urls(paper: dict[str, Any], *, include_oa_lookups: bool = True) -
         else:
             try:
                 with bounded_request_policy(max_attempts=2, max_wait_seconds=5.0, wall_timeout_seconds=30.0):
-                    response = get(f"https://api.openalex.org/works/https://doi.org/{quote(doi, safe='')}")
+                    response = get(
+                        f"https://api.openalex.org/works/https://doi.org/{quote(doi, safe='')}",
+                        params=_openalex_params(),
+                    )
                 receipts.append({"kind": "openalex_lookup", **receipt(response)})
                 if response.ok:
                     payload = response.json()
@@ -337,6 +350,7 @@ def _candidate_urls(paper: dict[str, Any], *, include_oa_lookups: bool = True) -
                     response = get(
                         "https://api.semanticscholar.org/graph/v1/paper/search",
                         params={"query": title, "limit": 5, "fields": "title,openAccessPdf,externalIds"},
+                        headers=_semantic_scholar_headers(),
                         timeout=30,
                     )
                 receipts.append({"kind": "semantic_scholar_title_lookup", **receipt(response)})

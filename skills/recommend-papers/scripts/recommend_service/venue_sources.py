@@ -36,6 +36,19 @@ def title_key(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", clean(value).lower())
 
 
+def _openalex_params(params: dict[str, Any] | None = None) -> dict[str, Any]:
+    values = dict(params or {})
+    api_key = clean(os.environ.get("OPENALEX_API_KEY"))
+    if api_key:
+        values["api_key"] = api_key
+    return values
+
+
+def _semantic_scholar_headers() -> dict[str, str]:
+    api_key = clean(os.environ.get("SEMANTIC_SCHOLAR_API_KEY") or os.environ.get("S2_API_KEY"))
+    return {"x-api-key": api_key} if api_key else {}
+
+
 def stable_id(prefix: str, value: str) -> str:
     return f"{prefix}:{hashlib.sha256(value.encode('utf-8')).hexdigest()[:24]}"
 
@@ -578,7 +591,7 @@ def _indexed_enrich_once(row: dict[str, Any], *, allow_remote_arxiv: bool = True
             row["abstract"] = abstract
     if doi and not clean(row.get("abstract")) and cooldown_remaining("openalex") <= 0:
         try:
-            response = get(f"https://api.openalex.org/works/https://doi.org/{quote(doi, safe='')}", timeout=45)
+            response = get(f"https://api.openalex.org/works/https://doi.org/{quote(doi, safe='')}", params=_openalex_params(), timeout=45)
             attempts.append({"source": "openalex_doi_for_acm", **receipt(response)})
             if response.ok:
                 payload = response.json()
@@ -589,8 +602,11 @@ def _indexed_enrich_once(row: dict[str, Any], *, allow_remote_arxiv: bool = True
             attempts.append({"source": "openalex_doi_for_acm", "error": str(exc)[:300]})
     if not clean(row.get("abstract")) and cooldown_remaining("openalex") <= 0:
         try:
-            query = quote(clean(row.get("title")), safe="")
-            response = get(f"https://api.openalex.org/works?search={query}&per-page=5", timeout=45)
+            response = get(
+                "https://api.openalex.org/works",
+                params=_openalex_params({"search": clean(row.get("title")), "per-page": 5}),
+                timeout=45,
+            )
             attempts.append({"source": "openalex_title_for_acm", **receipt(response)})
             if response.ok:
                 for work in (response.json().get("results") or []):
@@ -605,7 +621,12 @@ def _indexed_enrich_once(row: dict[str, Any], *, allow_remote_arxiv: bool = True
         try:
             key = f"DOI:{doi}" if doi else f"CorpusID:{quote(clean(row.get('title')), safe='')}"
             if doi:
-                response = get(f"https://api.semanticscholar.org/graph/v1/paper/{quote(key, safe=':')}?fields=title,abstract,openAccessPdf", timeout=45)
+                response = get(
+                    f"https://api.semanticscholar.org/graph/v1/paper/{quote(key, safe=':')}",
+                    params={"fields": "title,abstract,openAccessPdf"},
+                    headers=_semantic_scholar_headers(),
+                    timeout=45,
+                )
                 attempts.append({"source": "semantic_scholar_doi_for_acm", **receipt(response)})
                 if response.ok:
                     payload = response.json()
@@ -616,7 +637,12 @@ def _indexed_enrich_once(row: dict[str, Any], *, allow_remote_arxiv: bool = True
             attempts.append({"source": "semantic_scholar_doi_for_acm", "error": str(exc)[:300]})
     if not clean(row.get("abstract")) and cooldown_remaining("semantic_scholar") <= 0:
         try:
-            response = get("https://api.semanticscholar.org/graph/v1/paper/search", params={"query": clean(row.get("title")), "limit": 5, "fields": "title,abstract,openAccessPdf,externalIds"}, timeout=45)
+            response = get(
+                "https://api.semanticscholar.org/graph/v1/paper/search",
+                params={"query": clean(row.get("title")), "limit": 5, "fields": "title,abstract,openAccessPdf,externalIds"},
+                headers=_semantic_scholar_headers(),
+                timeout=45,
+            )
             attempts.append({"source": "semantic_scholar_title_for_acm", **receipt(response)})
             if response.ok:
                 for item in response.json().get("data") or []:
@@ -791,13 +817,21 @@ def _batch_openalex_enrich(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for row in rows:
             row.setdefault("metadata", {}).setdefault("indexed_enrichment", []).append({"source": "openalex_doi_for_acm_batch", "status": "skipped_persisted_long_cooldown", "cooldown_remaining_seconds": round(cooldown_remaining("openalex"), 3)})
         return rows
-    by_doi = {clean((row.get("identifiers") or {}).get("doi")).lower(): row for row in rows if clean((row.get("identifiers") or {}).get("doi"))}
+    by_doi = {
+        clean((row.get("identifiers") or {}).get("doi")).lower(): row
+        for row in rows
+        if not clean(row.get("abstract")) and clean((row.get("identifiers") or {}).get("doi"))
+    }
     dois = sorted(by_doi)
     for offset in range(0, len(dois), 50):
         chunk = dois[offset:offset + 50]
         try:
             with bounded_request_policy(max_attempts=2, max_wait_seconds=15.0):
-                response = get("https://api.openalex.org/works", params={"filter": "doi:" + "|".join(chunk), "per-page": 50, "select": "id,doi,display_name,abstract_inverted_index,best_oa_location,primary_location,authorships"}, timeout=90)
+                response = get(
+                    "https://api.openalex.org/works",
+                    params=_openalex_params({"filter": "doi:" + "|".join(chunk), "per-page": 50, "select": "id,doi,display_name,abstract_inverted_index,best_oa_location,primary_location,authorships"}),
+                    timeout=90,
+                )
             if not response.ok:
                 continue
             for item in response.json().get("results") or []:
@@ -818,15 +852,28 @@ def _batch_openalex_enrich(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _batch_semantic_scholar_enrich(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if cooldown_remaining("semantic_scholar") > 0:
+    # Anonymous S2 commonly asks for a short pause. Let the bounded request
+    # governor honor a small active cooldown instead of turning it into a
+    # false permanent abstract gap; defer only genuinely long waits.
+    if cooldown_remaining("semantic_scholar") > 15:
         return rows
-    by_doi = {clean((row.get("identifiers") or {}).get("doi")).lower(): row for row in rows if clean((row.get("identifiers") or {}).get("doi"))}
+    by_doi = {
+        clean((row.get("identifiers") or {}).get("doi")).lower(): row
+        for row in rows
+        if not clean(row.get("abstract")) and clean((row.get("identifiers") or {}).get("doi"))
+    }
     dois = sorted(by_doi)
     for offset in range(0, len(dois), 500):
         chunk = dois[offset:offset + 500]
         try:
             with bounded_request_policy(max_attempts=2, max_wait_seconds=15.0):
-                response = post("https://api.semanticscholar.org/graph/v1/paper/batch", params={"fields": "title,abstract,openAccessPdf,externalIds"}, json_body={"ids": [f"DOI:{doi}" for doi in chunk]}, timeout=120)
+                response = post(
+                    "https://api.semanticscholar.org/graph/v1/paper/batch",
+                    params={"fields": "title,abstract,openAccessPdf,externalIds"},
+                    json_body={"ids": [f"DOI:{doi}" for doi in chunk]},
+                    headers=_semantic_scholar_headers(),
+                    timeout=120,
+                )
             if not response.ok:
                 continue
             for item in response.json() or []:
@@ -1107,7 +1154,10 @@ def _official_acm_title_seed(venue_id: str, year: int) -> tuple[list[dict[str, A
     """
     urls: list[str] = []
     if venue_id == "www":
-        urls = [f"https://www{year}.thewebconf.org/accepted/research-tracks.html"]
+        urls = [
+            f"https://www{year}.thewebconf.org/program/full-schedule.html",
+            f"https://www{year}.thewebconf.org/accepted/research-tracks.html",
+        ]
     elif venue_id == "sigir":
         urls = [
             f"https://sigir{year}.org/en-AU/pages/program/accepted-papers",
@@ -1144,7 +1194,7 @@ def _official_acm_title_seed(venue_id: str, year: int) -> tuple[list[dict[str, A
         elif venue_id == "sigir":
             candidates = [node for node in soup.find_all("p") if node.find("i") and re.search(r"\[[a-z]+]", node.get_text(" ", strip=True), re.I)]
         elif venue_id == "www":
-            candidates = [node for node in soup.find_all("li") if node.select_one(".paper-id")]
+            candidates = soup.select("li.paper-item") or [node for node in soup.find_all("li") if node.select_one(".paper-id")]
         else:
             candidates = soup.select("article, tr, li, .paper, .accepted-paper, .paper-item, .program-item")
         for node in candidates:
@@ -1192,6 +1242,158 @@ def _official_acm_title_seed(venue_id: str, year: int) -> tuple[list[dict[str, A
     return rows, receipts
 
 
+def _official_cikm_proceedings(year: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Read CIKM's published proceedings mirror when it embeds every abstract.
+
+    The accepted-papers table is only a preliminary title pool. CIKM 2025's
+    official proceedings page is materially stronger: each published item has
+    an ACM DOI, authors, and the full abstract in the page itself. Treat that
+    page as the authoritative corpus instead of unioning it with broader DBLP
+    or preliminary accepted-paper rows that cannot all be abstract-enriched.
+    """
+    url = f"https://cikm{year}.org/program/proceedings"
+    try:
+        response = _response(url, timeout=120)
+    except Exception:
+        return [], []
+    soup = BeautifulSoup(response.text, "html.parser")
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for anchor in soup.select('a.sub_title_3[href*="dl.acm.org/doi/"]'):
+        title = clean(anchor.get_text(" ", strip=True))
+        key = title_key(title)
+        if not looks_like_title(title) or key in seen:
+            continue
+        abstract_node = anchor.find_next("div", class_="sub_txt")
+        authors_node = anchor.find_next("ul", class_="proceed_name_list_han")
+        abstract = clean(abstract_node.get_text(" ", strip=True) if abstract_node else "")
+        authors = [clean(node.get_text(" ", strip=True)) for node in authors_node.select("li")] if authors_node else []
+        detail_url = urljoin(url, str(anchor.get("href") or ""))
+        doi_match = re.search(r"10\.1145/\d+(?:\.\d+)?", detail_url, re.I)
+        session_node = anchor.find_previous(
+            lambda node: getattr(node, "name", None) in {"div", "h2", "h3", "h4"}
+            and "SESSION:" in clean(node.get_text(" ", strip=True))
+        )
+        session = re.sub(
+            r"^SESSION:\s*", "", clean(session_node.get_text(" ", strip=True) if session_node else ""), flags=re.I
+        )
+        seen.add(key)
+        rows.append({
+            "title": title,
+            "abstract": abstract,
+            "authors": authors,
+            "published": f"{year}-01-01",
+            "year": year,
+            "url": detail_url,
+            "pdf_url": f"https://dl.acm.org/doi/pdf/{doi_match.group(0)}" if doi_match else "",
+            "venue": "CIKM",
+            "categories": [session] if session else [],
+            "identifiers": {"doi": doi_match.group(0) if doi_match else ""},
+            "metadata": {"official_proceedings_source": url, "session": session},
+        })
+    # A partial/template page is not an authoritative proceedings corpus. The
+    # common validator below remains the sole completion gate for every venue.
+    if not rows or any(len(clean(row.get("abstract"))) < 80 or not row.get("authors") for row in rows):
+        return [], [receipt(response)]
+    return rows, [receipt(response)]
+
+
+def _official_sigir_program(year: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Extract the paper catalog and embedded abstracts from SIGIR's program PDF."""
+    url = f"https://sigir{year}.org/SIGIR{year}_program.pdf"
+    try:
+        response = get(url, timeout=120, headers={"User-Agent": "Mozilla/5.0 (compatible; TASTE-Recommend-Papers/1.0)"})
+        response.raise_for_status()
+        if not response.content.startswith(b"%PDF"):
+            return [], [receipt(response)]
+        document = fitz.open(stream=response.content, filetype="pdf")
+    except Exception:
+        return [], []
+    blocks: list[tuple[int, float, str, int]] = []
+    try:
+        for page_index, page in enumerate(document):
+            page_blocks: list[tuple[int, float, str, int]] = []
+            for block in page.get_text("blocks", sort=False):
+                text = "\n".join(line.strip() for line in block[4].splitlines() if line.strip())
+                if not text:
+                    continue
+                column = 0 if float(block[0]) < 290 else 1
+                page_blocks.append((column, float(block[1]), text, page_index + 1))
+            blocks.extend(sorted(page_blocks, key=lambda item: (item[0], item[1])))
+    finally:
+        document.close()
+    track_pattern = re.compile(
+        r"\[(Full|Short|Industry|Resource|Reproducibility|Demo|Low-Resource|Perspective|TOIS)\]\s*$",
+        re.I,
+    )
+    headings: list[tuple[int, str, str, int]] = []
+    for index, (_column, _top, text, page_number) in enumerate(blocks):
+        flattened = clean(text)
+        match = track_pattern.search(flattened)
+        if not match:
+            continue
+        title = clean(track_pattern.sub("", flattened))
+        if looks_like_title(title):
+            headings.append((index, title, match.group(1), page_number))
+    rows: list[dict[str, Any]] = []
+    for heading_index, (block_index, title, track, page_number) in enumerate(headings):
+        end = headings[heading_index + 1][0] if heading_index + 1 < len(headings) else len(blocks)
+        lines: list[str] = []
+        for _column, _top, text, _page in blocks[block_index + 1:end]:
+            lines.extend(line.strip() for line in text.splitlines() if line.strip())
+        author_end = 0
+        author_text = ""
+        for line_index, line in enumerate(lines[:40]):
+            author_text = clean(f"{author_text} {line}")
+            if (
+                "(" in author_text
+                and author_text.count("(") == author_text.count(")")
+                and re.search(r"\)\s*$", line)
+                and not re.search(r"\)\s*;\s*$", line)
+            ):
+                author_end = line_index + 1
+                break
+        authors = [clean(part.split("(", 1)[0]) for part in author_text.split(";") if clean(part.split("(", 1)[0])]
+        abstract_lines: list[str] = []
+        for line in lines[author_end:]:
+            if re.search(
+                r"·\s*[^·]+\s*·\s*(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b",
+                line,
+                re.I,
+            ):
+                break
+            if re.fullmatch(rf"(?:SIGIR\s*{year}|Program|\d+)", line, re.I):
+                continue
+            abstract_lines.append(line)
+        abstract = clean(" ".join(abstract_lines))
+        abstract = re.sub(r"^\\begin\{abstract\}\s*", "", abstract, flags=re.I)
+        abstract = re.sub(r"\\end\{abstract\}\s*$", "", abstract, flags=re.I)
+        abstract = re.split(
+            r"\s+[A-Z][^.!?]{2,80}\s+·\s+[^·]{2,40}\s+·\s+(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b",
+            abstract,
+            maxsplit=1,
+            flags=re.I,
+        )[0]
+        rows.append({
+            "title": title,
+            "abstract": abstract if len(abstract) >= 80 else "",
+            "authors": authors,
+            "published": f"{year}-01-01",
+            "year": year,
+            "url": url,
+            "pdf_url": "",
+            "venue": "SIGIR",
+            "categories": [track],
+            "identifiers": {},
+            "metadata": {"official_program_source": url, "program_page": page_number, "track": track},
+        })
+    # Reject a cover-only or malformed booklet; individual missing abstracts
+    # remain eligible for the same exact-identity fallback used by all ACM rows.
+    if len(rows) < 100 or not all(row.get("authors") for row in rows):
+        return [], [receipt(response)]
+    return rows, [receipt(response)]
+
+
 def _merge_title_rows(primary: list[dict[str, Any]], enrichment: list[dict[str, Any]]) -> list[dict[str, Any]]:
     by_title = {title_key(row.get("title")): row for row in enrichment if title_key(row.get("title"))}
     out: list[dict[str, Any]] = []
@@ -1212,8 +1414,34 @@ def fetch_acm_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[st
     venue_id = clean(spec.get("venue_id")).lower()
     venue, _template = DBLP_TEMPLATES[venue_id]
     year = int(spec["years"][0])
+    if venue_id == "cikm":
+        proceedings_rows, proceedings_receipts = _official_cikm_proceedings(year)
+        if proceedings_rows:
+            discovered_count = len(proceedings_rows)
+            selected = _selected_rows(spec, proceedings_rows)
+            result_rows, details = _finish_rows(
+                spec,
+                selected,
+                adapter="cikm_official_proceedings",
+                requests=proceedings_receipts,
+                proof="official_cikm_proceedings_page_exhausted_with_embedded_abstracts",
+                discovered_count=discovered_count,
+            )
+            details.update({
+                "official_proceedings_count": discovered_count,
+                "official_title_pool_count": discovered_count,
+                "checkpoint_mode": "not_needed_official_embedded_abstracts",
+            })
+            return result_rows, details
+    sigir_program_rows: list[dict[str, Any]] = []
+    sigir_program_receipts: list[dict[str, Any]] = []
+    if venue_id == "sigir":
+        sigir_program_rows, sigir_program_receipts = _official_sigir_program(year)
     urls, index_receipts = _dblp_year_xml_urls(venue_id, year)
-    official_rows, official_receipts = _official_acm_title_seed(venue_id, year)
+    if sigir_program_rows:
+        official_rows, official_receipts = sigir_program_rows, sigir_program_receipts
+    else:
+        official_rows, official_receipts = _official_acm_title_seed(venue_id, year)
     rows = []
     requests = [*index_receipts, *official_receipts]
     seen = set()
@@ -1240,7 +1468,11 @@ def fetch_acm_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[st
                     doi = match.group(1).rstrip(".,)")
                     break
             rows.append({"title": title, "abstract": "", "authors": authors, "published": f"{year}-01-01", "year": year, "url": next((value for value in ee if value), ""), "pdf_url": next((value for value in ee if re.search(r"\.pdf(?:$|[?#])", value, re.I)), ""), "venue": venue, "categories": [], "identifiers": {"doi": doi, "dblp_key": clean(record.attrib.get("key"))}, "metadata": {"dblp_seed_url": url, "seed_only": True}})
-    if official_rows:
+    if sigir_program_rows:
+        rows = _merge_title_rows(sigir_program_rows, rows)
+        for row in rows:
+            row.setdefault("metadata", {})["official_title_pool_observed"] = True
+    elif official_rows:
         official_keys = {title_key(row.get("title")) for row in official_rows}
         dblp_by_title = {title_key(row.get("title")): row for row in rows}
         missing_from_dblp = [row for row in official_rows if title_key(row.get("title")) not in dblp_by_title]
@@ -1298,7 +1530,10 @@ def fetch_acm_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[st
         if not probe_only:
             _save_acm_checkpoint(venue_id, year, row)
             _write_acm_progress(venue_id, year, rows, "indexed_fallback_enrichment")
-    proof = "official_accepted_pool_merged_with_dblp_and_taste_indexed_abstract_enrichment" if official_rows else "complete_dblp_title_pool_with_taste_indexed_abstract_enrichment"
+    if sigir_program_rows:
+        proof = "official_sigir_program_pdf_exhausted_with_exact_identity_enrichment"
+    else:
+        proof = "official_accepted_pool_merged_with_dblp_and_taste_indexed_abstract_enrichment" if official_rows else "complete_dblp_title_pool_with_taste_indexed_abstract_enrichment"
     result_rows, details = _finish_rows(
         spec,
         rows,
