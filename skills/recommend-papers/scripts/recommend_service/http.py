@@ -171,7 +171,7 @@ def concurrency_limit(service: str) -> int:
         return DEFAULT_CONCURRENCY.get(service, DEFAULT_CONCURRENCY["generic"])
 
 
-def _mutate_state(service: str, callback: Callable[[dict[str, Any]], None]) -> None:
+def _mutate_state(service: str, callback: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
     path = _state_path(service)
     path.parent.mkdir(parents=True, exist_ok=True)
     with FileLock(str(_state_lock_path(service))):
@@ -181,6 +181,7 @@ def _mutate_state(service: str, callback: Callable[[dict[str, Any]], None]) -> N
         callback(state)
         state["updated_at"] = now_iso()
         write_json(path, state)
+        return state
 
 
 @contextmanager
@@ -214,7 +215,16 @@ def cooldown_remaining(service: str) -> float:
     state = read_json(_state_path(service), {})
     if not isinstance(state, dict):
         return 0.0
-    return max(0.0, float(state.get("cooldown_until") or 0) - time.time())
+    remaining = float(state.get("cooldown_until") or 0) - time.time()
+    if remaining <= 0 and any(key in state for key in ("cooldown_until", "reason", "retry_attempt")):
+        def clear_expired(current: dict[str, Any]) -> None:
+            if float(current.get("cooldown_until") or 0) <= time.time():
+                for key in ("cooldown_until", "reason", "retry_attempt"):
+                    current.pop(key, None)
+
+        current = _mutate_state(service, clear_expired)
+        return max(0.0, float(current.get("cooldown_until") or 0) - time.time())
+    return max(0.0, remaining)
 
 
 def _minimum_optional(current: float | int | None, requested: float | int) -> float | int:
@@ -256,6 +266,9 @@ def request_slot(service: str, *, max_wait_seconds: float | None = None) -> Iter
 
                 def reserve(state: dict[str, Any]) -> None:
                     now = time.time()
+                    if float(state.get("cooldown_until") or 0) <= now:
+                        for key in ("cooldown_until", "reason", "retry_attempt"):
+                            state.pop(key, None)
                     cooldown_wait = max(0.0, float(state.get("cooldown_until") or 0) - now)
                     spacing_wait = max(
                         0.0,

@@ -149,6 +149,11 @@ def create_run() -> Path:
         "status": "active",
         "counts": {},
         "warnings": [],
+        "active_warnings": [],
+        "warning_history": [],
+        "resolved_warnings": [],
+        "coverage_notices": [],
+        "historical_incidents": [],
     })
     return run_dir
 
@@ -168,7 +173,16 @@ def clean_run_id(value: Any) -> str:
     return str(value or "").strip()
 
 
-def update_run(run_dir: Path, *, stage: str, status: str = "active", counts: dict[str, int] | None = None, warnings: list[str] | None = None) -> dict[str, Any]:
+def update_run(
+    run_dir: Path,
+    *,
+    stage: str,
+    status: str = "active",
+    counts: dict[str, int] | None = None,
+    warnings: list[str] | None = None,
+    coverage_notices: list[dict[str, Any]] | None = None,
+    incidents: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     path = run_dir / "run.json"
     lock_path = safe_write_target(run_dir / ".run-state.lock")
     with FileLock(str(lock_path)):
@@ -187,6 +201,34 @@ def update_run(run_dir: Path, *, stage: str, status: str = "active", counts: dic
             merged_counts.update(counts)
             state["counts"] = merged_counts
         if warnings is not None:
-            state["warnings"] = warnings
+            previous = [str(item) for item in state.get("warnings") or []]
+            current = [str(item) for item in warnings]
+            history = list(state.get("warning_history") or [])
+            changed_at = now_iso()
+            for message in current:
+                if message not in previous:
+                    history.append({"action": "raised", "message": message, "stage": stage, "at": changed_at})
+            for message in previous:
+                if message not in current:
+                    history.append({"action": "resolved", "message": message, "stage": stage, "at": changed_at})
+            state["warnings"] = current
+            state["active_warnings"] = current
+            state["warning_history"] = history
+            state["resolved_warnings"] = list(dict.fromkeys(
+                item["message"]
+                for item in history
+                if isinstance(item, dict) and item.get("action") == "resolved" and item.get("message")
+            ))
+        if coverage_notices is not None:
+            state["coverage_notices"] = coverage_notices
+        if incidents:
+            existing = list(state.get("historical_incidents") or [])
+            known = {str(item.get("incident_id") or "") for item in existing if isinstance(item, dict)}
+            for incident in incidents:
+                incident_id = str(incident.get("incident_id") or stable_hash(incident))
+                if incident_id not in known:
+                    existing.append({**incident, "incident_id": incident_id})
+                    known.add(incident_id)
+            state["historical_incidents"] = existing
         write_json(path, state)
     return state

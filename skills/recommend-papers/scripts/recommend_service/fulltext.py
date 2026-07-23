@@ -861,6 +861,4 @@ def acquire_many(papers: list[dict[str, Any]], run_dir: Path, workers: int) -> d
         "items": results,
         "completed_at": now_iso(),
     }
-    write_json(run_dir / "full_text_results.json", payload)
-    update_run(run_dir, stage="fulltext_complete", status="active", counts={"requested": len(results), "completed": len(results), "ready": ready}, warnings=[] if ready == len(results) else [f"Full text unavailable for {len(results) - ready} papers"])
     return payload

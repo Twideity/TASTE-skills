@@ -159,6 +159,8 @@ def _compact_metadata_result(result: dict[str, Any]) -> dict[str, Any]:
         "status": result.get("status"),
         "raw_count": result.get("raw_count"),
         "deduplicated_count": result.get("deduplicated_count"),
+        "metadata_profile": result.get("metadata_profile"),
+        "coverage_notice_count": len(result.get("coverage_notices") or []),
         "metadata_path": str(run_dir / "metadata.json"),
         "source_receipts": [
             {
@@ -187,6 +189,9 @@ def _compact_shortlist_result(result: dict[str, Any], run_dir: Path) -> dict[str
         "actual_count": result.get("actual_count"),
         "replacement_round": result.get("replacement_round"),
         "replacement_count": result.get("replacement_count"),
+        "replacement_count_last_round": result.get("replacement_count_last_round"),
+        "replacement_count_total": result.get("replacement_count_total"),
+        "attempted_identity_count": result.get("attempted_identity_count"),
         "strata": [
             {key: row.get(key) for key in ("venue", "year", "population_count", "sample_count", "kept_ready_count", "replacement_count") if key in row}
             for row in result.get("strata") or [] if isinstance(row, dict)
@@ -204,6 +209,8 @@ def _compact_fulltext_result(result: dict[str, Any], run_dir: Path) -> dict[str,
         "full_text_ready_count": result.get("full_text_ready_count"),
         "worker_count": result.get("worker_count"),
         "cooldown_requeue": result.get("cooldown_requeue") or {},
+        "history_entry_path": result.get("history_entry_path"),
+        "history_invocation_index": result.get("history_invocation_index"),
         "full_text_results_path": str(run_dir / "full_text_results.json"),
     }
 

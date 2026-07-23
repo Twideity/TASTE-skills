@@ -73,6 +73,50 @@ def _venue_key(value: Any) -> str:
     return aliases.get(key, key)
 
 
+def _source_field_coverage(papers: list[dict[str, Any]]) -> dict[str, Any]:
+    total = len(papers)
+    counts = {
+        "title": sum(bool(clean(item.get("title"))) for item in papers),
+        "authors": sum(bool(item.get("authors")) for item in papers),
+        "abstract": sum(bool(clean(item.get("abstract"))) for item in papers),
+        "url": sum(bool(clean(item.get("url"))) for item in papers),
+        "pdf_url": sum(bool(clean(item.get("pdf_url"))) for item in papers),
+    }
+    return {
+        "record_count": total,
+        **{f"{field}_count": count for field, count in counts.items()},
+        **{f"{field}_coverage": round(count / total, 6) if total else 0.0 for field, count in counts.items()},
+    }
+
+
+def _metadata_coverage_notices(receipts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    notices: list[dict[str, Any]] = []
+    for receipt in receipts:
+        source = receipt.get("source") if isinstance(receipt.get("source"), dict) else {}
+        coverage = receipt.get("field_coverage") if isinstance(receipt.get("field_coverage"), dict) else {}
+        total = int(coverage.get("record_count") or 0)
+        if total <= 0:
+            continue
+        for field in ("authors", "abstract", "pdf_url"):
+            present = int(coverage.get(f"{field}_count") or 0)
+            if present >= total:
+                continue
+            notices.append({
+                "severity": "notice",
+                "kind": f"{field}_incomplete",
+                "source_index": receipt.get("index"),
+                "venue": clean(source.get("venue_id") or source.get("venue")),
+                "year": int((source.get("years") or [0])[0] or 0),
+                "field": field,
+                "record_count": total,
+                "present_count": present,
+                "missing_count": total - present,
+                "coverage": coverage.get(f"{field}_coverage"),
+                "catalog_core_exception": bool(source.get("require_complete_abstracts") is False),
+            })
+    return notices
+
+
 def _require_venue_probe_receipts(plan: dict[str, Any], directory: Path) -> list[dict[str, Any]]:
     receipts = []
     for path in sorted((directory / "venue_probes").glob("*.json")):
@@ -146,7 +190,14 @@ def _run_metadata_locked(plan_path: Path, directory: Path) -> dict[str, Any]:
             papers, source_receipt = fetch_source(spec, policy=policy, max_age_days=max_age_days)
             details = source_receipt.get("details") if isinstance(source_receipt, dict) else None
             coverage_status = details.get("status") if isinstance(details, dict) else "complete"
-            row = {"index": index, "source": spec, "status": coverage_status, "paper_count": len(papers), "cache": source_receipt}
+            row = {
+                "index": index,
+                "source": spec,
+                "status": coverage_status,
+                "paper_count": len(papers),
+                "field_coverage": _source_field_coverage(papers),
+                "cache": source_receipt,
+            }
             warning = f"Source {index} coverage is {coverage_status}; inspect receipt and repair before scoring" if coverage_status != "complete" else ""
         except Exception as exc:
             papers = []
@@ -175,6 +226,8 @@ def _run_metadata_locked(plan_path: Path, directory: Path) -> dict[str, Any]:
     receipts = [receipts_by_index[index] for index in range(1, len(sources) + 1)]
     all_rows = [paper for index in range(1, len(sources) + 1) for paper in papers_by_index.get(index, [])]
     papers = deduplicate(all_rows)
+    coverage_notices = _metadata_coverage_notices(receipts)
+    metadata_profile = "catalog_core" if any(source.get("require_complete_abstracts") is False for source in sources) else "full_metadata"
     status = "complete" if papers and not warnings else "complete_with_gaps" if papers else "blocked"
     payload = {
         "schema_version": 1,
@@ -187,13 +240,22 @@ def _run_metadata_locked(plan_path: Path, directory: Path) -> dict[str, Any]:
         "probe_proofs": probe_proofs,
         "plan_fingerprint": stable_hash(plan),
         "metadata_fingerprint": stable_hash({"plan": plan, "probe_proofs": probe_proofs, "papers": papers}),
+        "metadata_profile": metadata_profile,
+        "coverage_notices": coverage_notices,
         "papers": papers,
         "source_receipts": receipts,
         "warnings": warnings,
     }
     write_json(directory / "metadata.json", payload)
     stage = "metadata_ready" if status == "complete" else "metadata_incomplete" if papers else "metadata_blocked"
-    update_run(directory, stage=stage, status="active" if papers else "blocked", counts={"sources": len(sources), "completed_sources": len(sources), "raw_papers": len(all_rows), "metadata_papers": len(papers)}, warnings=warnings)
+    update_run(
+        directory,
+        stage=stage,
+        status="active" if papers else "blocked",
+        counts={"sources": len(sources), "completed_sources": len(sources), "raw_papers": len(all_rows), "metadata_papers": len(papers)},
+        warnings=warnings,
+        coverage_notices=coverage_notices,
+    )
     return payload
 
 
@@ -217,6 +279,8 @@ def build_shortlist(run_dir: Path, scores_path: Path, target: int | None) -> dic
         raise ValueError("metadata.json is missing or empty")
     if metadata.get("status") is not None and metadata.get("status") != "complete":
         raise ValueError("metadata coverage is incomplete; repair all source receipts before scoring")
+    if metadata.get("metadata_profile") == "catalog_core":
+        raise ValueError("catalog-core metadata contains declared field gaps and cannot be used for abstract scoring")
     by_identity = {paper_identity(item): item for item in papers if isinstance(item, dict)}
     rows = _score_rows(read_json(scores_path, None))
     scored: dict[str, dict[str, Any]] = {}
@@ -336,6 +400,12 @@ def build_random_venue_shortlist(run_dir: Path, per_venue: int, seed: int | None
         "selection_method": "uniform_random_without_replacement_stratified_by_venue",
         "seed": actual_seed,
         "per_venue": per_venue,
+        "replacement_round": 0,
+        "replacement_count": 0,
+        "replacement_count_last_round": 0,
+        "replacement_count_total": 0,
+        "attempted_identities": sorted(paper_identity(item) for item in selected),
+        "attempted_identity_count": len(selected),
         "target_count": target_count,
         "actual_count": len(selected),
         "shortfall": 0,
@@ -351,6 +421,11 @@ def build_random_venue_shortlist(run_dir: Path, per_venue: int, seed: int | None
         "shortlist_actual": len(selected),
         "shortlist_venues": len(venue_sources),
         "shortlist_per_venue": per_venue,
+        "random_replacement_round": 0,
+        "random_replacements": 0,
+        "random_replacements_last_round": 0,
+        "random_replacements_total": 0,
+        "random_attempted_identities_total": len(selected),
     })
     return payload
 
@@ -424,12 +499,17 @@ def replace_failed_random_venue_papers(run_dir: Path) -> dict[str, Any]:
     if replacement_count == 0:
         raise ValueError("Every random venue selection already has acquired full text; no replacements are needed")
     attempted.update(paper_identity(item) for item in selected)
+    target_count = int(shortlist.get("target_count") or len(selected))
+    replacement_count_total = max(0, len(attempted) - target_count)
     payload = {
         **shortlist,
         "status": "complete",
         "replacement_round": replacement_round,
         "replacement_count": replacement_count,
+        "replacement_count_last_round": replacement_count,
+        "replacement_count_total": replacement_count_total,
         "attempted_identities": sorted(attempted),
+        "attempted_identity_count": len(attempted),
         "strata": strata,
         "papers": selected,
         "actual_count": len(selected),
@@ -440,9 +520,119 @@ def replace_failed_random_venue_papers(run_dir: Path) -> dict[str, Any]:
         "shortlist_target": len(selected),
         "shortlist_actual": len(selected),
         "random_replacement_round": replacement_round,
-        "random_replacements": replacement_count,
-    }, warnings=[])
+        "random_replacements": replacement_count_total,
+        "random_replacements_last_round": replacement_count,
+        "random_replacements_total": replacement_count_total,
+        "random_attempted_identities_total": len(attempted),
+    })
     return payload
+
+
+def _fulltext_round_incident(
+    result: dict[str, Any],
+    shortlist: dict[str, Any],
+    archive_path: Path,
+    invocation_index: int,
+) -> dict[str, Any]:
+    attempted_identity_count = int(shortlist.get("attempted_identity_count") or len(shortlist.get("attempted_identities") or []))
+    target_count = int(shortlist.get("target_count") or len(shortlist.get("papers") or []))
+    replacement_count_total = int(shortlist.get("replacement_count_total") or max(0, attempted_identity_count - target_count))
+    failure_steps: dict[str, int] = {}
+    unavailable_by_venue: dict[str, int] = {}
+    for item in result.get("items") or []:
+        paper = item.get("paper") if isinstance(item, dict) and isinstance(item.get("paper"), dict) else {}
+        venue = clean(paper.get("venue")) or "unknown"
+        if item.get("full_text_available") is not True:
+            unavailable_by_venue[venue] = unavailable_by_venue.get(venue, 0) + 1
+            item_reason = clean(item.get("error_type") or item.get("status") or item.get("message"))
+            if item_reason:
+                key = f"item:{item_reason}"
+                failure_steps[key] = failure_steps.get(key, 0) + 1
+        attempt_payload = item.get("attempts")
+        attempt_groups = (
+            attempt_payload.values()
+            if isinstance(attempt_payload, dict)
+            else [attempt_payload]
+            if isinstance(attempt_payload, list)
+            else []
+        )
+        for attempts in attempt_groups:
+            for attempt in attempts or []:
+                if not isinstance(attempt, dict):
+                    continue
+                try:
+                    status_code = int(attempt.get("status_code") or 0)
+                except (TypeError, ValueError):
+                    status_code = 0
+                failed = (
+                    attempt.get("accepted") is False
+                    or status_code >= 400
+                    or clean(attempt.get("status")).lower() in {"error", "skipped_cooldown", "skipped_persisted_cooldown"}
+                    or bool(attempt.get("error_type"))
+                )
+                if not failed:
+                    continue
+                kind = clean(attempt.get("kind")) or "unknown"
+                reason = clean(
+                    attempt.get("reason")
+                    or attempt.get("status")
+                    or attempt.get("error_type")
+                    or attempt.get("status_code")
+                    or "rejected"
+                )
+                key = f"{kind}:{reason}"
+                failure_steps[key] = failure_steps.get(key, 0) + 1
+    shortlist_fingerprint = clean(result.get("shortlist_fingerprint"))
+    return {
+        "incident_id": f"fulltext:{invocation_index:04d}:{shortlist_fingerprint}",
+        "kind": "fulltext_round",
+        "at": result.get("completed_at") or now_iso(),
+        "invocation_index": invocation_index,
+        "random_replacement_round": int(shortlist.get("replacement_round") or 0),
+        "random_replacement_count_last_round": int(shortlist.get("replacement_count_last_round") or shortlist.get("replacement_count") or 0),
+        "random_replacement_count_total": replacement_count_total,
+        "attempted_identity_count": attempted_identity_count,
+        "status": result.get("status"),
+        "requested_count": int(result.get("requested_count") or 0),
+        "ready_count": int(result.get("full_text_ready_count") or 0),
+        "unavailable_count": int(result.get("requested_count") or 0) - int(result.get("full_text_ready_count") or 0),
+        "unavailable_by_venue": dict(sorted(unavailable_by_venue.items())),
+        "failure_step_counts": dict(sorted(failure_steps.items())),
+        "cooldown_requeue": result.get("cooldown_requeue") or {},
+        "shortlist_fingerprint": shortlist_fingerprint,
+        "archive_path": str(archive_path),
+    }
+
+
+def _archive_fulltext_round(
+    directory: Path,
+    result: dict[str, Any],
+    shortlist: dict[str, Any],
+) -> tuple[Path, int, dict[str, Any]]:
+    history_dir = directory / "fulltext_rounds"
+    with run_lock(directory, "fulltext-history"):
+        indices = []
+        for path in history_dir.glob("*.json"):
+            try:
+                indices.append(int(path.stem))
+            except ValueError:
+                continue
+        invocation_index = max(indices, default=-1) + 1
+        archive_path = history_dir / f"{invocation_index:04d}.json"
+        attempted_identity_count = int(shortlist.get("attempted_identity_count") or len(shortlist.get("attempted_identities") or []))
+        target_count = int(shortlist.get("target_count") or len(shortlist.get("papers") or []))
+        replacement_count_total = int(shortlist.get("replacement_count_total") or max(0, attempted_identity_count - target_count))
+        archived = {
+            **result,
+            "history_schema_version": 1,
+            "history_invocation_index": invocation_index,
+            "random_replacement_round": int(shortlist.get("replacement_round") or 0),
+            "random_replacement_count_last_round": int(shortlist.get("replacement_count_last_round") or shortlist.get("replacement_count") or 0),
+            "random_replacement_count_total": replacement_count_total,
+            "attempted_identity_count": attempted_identity_count,
+        }
+        write_json(archive_path, archived)
+    return archive_path, invocation_index, _fulltext_round_incident(result, shortlist, archive_path, invocation_index)
 
 
 def run_fulltext(run_dir: Path, workers: int) -> dict[str, Any]:
@@ -461,7 +651,33 @@ def run_fulltext(run_dir: Path, workers: int) -> dict[str, Any]:
     result = acquire_many(papers, directory, workers)
     result["metadata_fingerprint"] = metadata.get("metadata_fingerprint")
     result["shortlist_fingerprint"] = stable_hash(shortlist)
+    archive_path, invocation_index, incident = _archive_fulltext_round(directory, result, shortlist)
+    result["history_entry_path"] = str(archive_path)
+    result["history_invocation_index"] = invocation_index
     write_json(directory / "full_text_results.json", result)
+    attempted_total = int(shortlist.get("attempted_identity_count") or len(shortlist.get("attempted_identities") or papers))
+    target_total = int(shortlist.get("target_count") or len(papers))
+    replacement_total = int(shortlist.get("replacement_count_total") or max(0, attempted_total - target_total))
+    requested = int(result.get("requested_count") or 0)
+    ready = int(result.get("full_text_ready_count") or 0)
+    update_run(
+        directory,
+        stage="fulltext_complete",
+        status="active",
+        counts={
+            "requested": requested,
+            "completed": requested,
+            "ready": ready,
+            "random_replacement_round": int(shortlist.get("replacement_round") or 0),
+            "random_replacements": replacement_total,
+            "random_replacements_last_round": int(shortlist.get("replacement_count_last_round") or shortlist.get("replacement_count") or 0),
+            "random_replacements_total": replacement_total,
+            "random_attempted_identities_total": attempted_total,
+            "fulltext_history_entries": invocation_index + 1,
+        },
+        warnings=[] if ready == requested else [f"Full text unavailable for {requested - ready} papers"],
+        incidents=[incident],
+    )
     return result
 
 

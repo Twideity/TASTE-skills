@@ -31,6 +31,7 @@ metadata_scores.raw.json
 metadata_scores.json
 shortlist.json
 full_text_results.json
+fulltext_rounds/<zero-padded-invocation>.json
 papers/<index>/acquisition.json
 evidence_cards.jsonl
 evidence_cards.validated.json
@@ -39,6 +40,8 @@ recommendations.md
 ```
 
 `run.json` tracks the active stage and counts. State updates are atomic and cross-process locked. Downstream commands require an existing initialized run, reject a mistyped path instead of silently creating it, and reject mutation after completion. `complete` closes recommendation workflows; `finish-stage` closes an intentional partial workflow after validating its selected endpoint.
+
+`warnings` and `active_warnings` describe only the current state. Warning transitions are append-only in `warning_history`, resolved messages remain in `resolved_warnings`, structured non-blocking field gaps remain in `coverage_notices`, and each full-text invocation adds a compact entry to `historical_incidents`. A clean final warning list must never erase the run's earlier failures or recoveries.
 
 ## Multi-turn and partial workflows
 
@@ -121,7 +124,11 @@ For an explicit request to sample papers uniformly at random within each selecte
 
 If that explicit task requires a successful per-venue PDF count rather than merely attempted downloads, `replace-failed-random-venue` preserves every ready paper and draws only the missing count from previously untried papers in the same venue/year. It records a deterministic replacement round and cumulative attempted identities. Rerunning `fulltext` reuses validated successful caches. Repeat only until every stratum reaches its requested ready count or the same-venue population is genuinely exhausted.
 
+Random shortlist artifacts expose `replacement_count_last_round`, `replacement_count_total`, and `attempted_identity_count`; run counts mirror them as `random_replacements_last_round`, `random_replacements_total`, and `random_attempted_identities_total`. The legacy `replacement_count` remains the last-round value in the shortlist for compatibility, while `run.json.counts.random_replacements` is cumulative.
+
 Priority-venue recommendation and topical-scoring workflows still require a real abstract for every cached row. A venue source may set `require_complete_abstracts: false` only for an explicit catalog-core workflow that does not score or recommend from abstracts, such as per-venue random sampling followed by full-text acquisition. The adapter must still prove catalog exhaustion and the core audit still requires unique identities plus at least 95% author and link coverage. Its receipt records abstract coverage and gaps; a later abstract-scoring workflow cannot reuse that cache as full-abstract metadata.
+
+Metadata persists `metadata_profile` (`full_metadata` or `catalog_core`) plus source-level field coverage. Missing authors, abstracts, and direct PDF URLs produce structured `coverage_notices` in both `metadata.json` and `run.json`; these notices do not falsely make an explicitly authorized catalog-core crawl incomplete, but ordinary abstract scoring rejects that profile.
 
 When downstream work requires at least a known number of papers per conference, set `minimum_catalog_records` on every venue source. Formal acquisition fails below that count even if API pagination is exhausted: exhaustion proves that all currently visible rows were fetched, not that an early/partially public accepted-paper catalog is the whole conference. Resolve the next real edition with a new probe receipt rather than sampling from a visibly undersized catalog.
 
@@ -135,9 +142,13 @@ One full-text acquisition worker never waits indefinitely for either a persisted
 
 Before every concrete PDF candidate request, acquisition checks that candidate service's persisted cooldown. A cooling service is recorded as `skipped_persisted_cooldown` and the worker immediately tries the next same-paper route; it never joins a queued line that wakes one worker at a time only to renew the same ACM/OpenReview challenge cooldown. This preflight is in addition to, not a replacement for, the shared slot and retry governor.
 
+Every completed full-text invocation is written first to an immutable, monotonically numbered `fulltext_rounds/NNNN.json`, including all item attempts, fingerprints, random-round counters, and cooldown recovery. The canonical `full_text_results.json` then points to that entry. A compact incident summary retains unavailable counts, affected venues, and failed-step counts in `run.json.historical_incidents`, so later replacement rounds cannot erase earlier evidence.
+
 The same preflight applies before HTML fallback. ACM DOI landing URLs (`doi.org/10.1145/...`) are attributed to the `acm` service before following redirects, so an ACM challenge cannot hide behind a separate DOI-host queue and serialize every remaining worker.
 
 The shared request slot itself also caps ACM cooldown/slot waiting at five seconds (`ACM_MAX_COOLDOWN_WAIT_SEC`), taking the smaller of this service ceiling and any caller budget. This closes the atomic race where several workers pass an outer zero-cooldown preflight before the first response records a 403; queued followers defer instead of sleeping and renewing that challenge one by one.
+
+Expired HTTP cooldown state is cleared atomically when read or before the next request reservation. Historical `reason`, `retry_attempt`, and `cooldown_until` fields therefore cannot remain visible after their deadline and be mistaken for an active block.
 
 Optional per-paper OpenAlex, Unpaywall, Semantic Scholar, HAL, and arXiv discovery calls additionally use a nested short wait/wall budget. This closes the race where many workers all observe zero cooldown just before the first 429 and then queue behind the newly persisted cooldown. Deferral is recorded as an optional-route failure and acquisition continues with other same-paper routes.
 
