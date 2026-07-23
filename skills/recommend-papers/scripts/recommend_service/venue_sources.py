@@ -22,6 +22,7 @@ from urllib.parse import quote, urljoin
 
 from bs4 import BeautifulSoup
 import fitz
+from filelock import FileLock
 
 from .http import bounded_request_policy, cooldown_remaining, get, post, receipt
 from .storage import DATA_ROOT, METADATA_CACHE_ROOT, read_json, write_json
@@ -226,23 +227,6 @@ def _finish_rows(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     limit = _probe_limit(spec)
     if not limit:
-        if spec.get("require_complete_abstracts") is False:
-            missing = sum(not clean(row.get("abstract")) for row in rows)
-            if not rows:
-                raise RuntimeError(f"{adapter} full-metadata crawl returned no records")
-            return rows, {
-                "status": "complete",
-                "complete_catalog": True,
-                "exhausted": True,
-                "truncated": False,
-                "exhaustion_proof": proof,
-                "adapter": adapter,
-                "count": len(rows),
-                "abstracts_complete": len(rows) - missing,
-                "missing_abstracts": missing,
-                "abstract_requirement": "not_required_by_explicit_catalog_core_workflow",
-                "requests": requests,
-            }
         return _result(rows, adapter=adapter, requests=requests, proof=proof)
     samples = rows[:limit]
     missing = sum(not clean(row.get("abstract")) for row in samples)
@@ -587,6 +571,11 @@ def _indexed_enrich_once(row: dict[str, Any], *, allow_remote_arxiv: bool = True
     identifiers = row.setdefault("identifiers", {})
     doi = clean(identifiers.get("doi"))
     attempts = row.setdefault("metadata", {}).setdefault("indexed_enrichment", [])
+    if not clean(row.get("abstract")) and clean(row.get("pdf_url")):
+        abstract = _official_pdf_abstract(row)
+        attempts.append({"source": "indexed_oa_pdf_for_acm", "status": "abstract_extracted" if abstract else "no_abstract_extracted"})
+        if abstract:
+            row["abstract"] = abstract
     if doi and not clean(row.get("abstract")) and cooldown_remaining("openalex") <= 0:
         try:
             response = get(f"https://api.openalex.org/works/https://doi.org/{quote(doi, safe='')}", timeout=45)
@@ -660,6 +649,11 @@ def _indexed_enrich_once(row: dict[str, Any], *, allow_remote_arxiv: bool = True
                     break
         except Exception as exc:
             attempts.append({"source": "hal_title_for_acm", "error": str(exc)[:300]})
+    if not clean(row.get("abstract")) and clean(row.get("pdf_url")):
+        abstract = _official_pdf_abstract(row)
+        attempts.append({"source": "indexed_oa_pdf_for_acm", "status": "abstract_extracted" if abstract else "no_abstract_extracted"})
+        if abstract:
+            row["abstract"] = abstract
     if not clean(row.get("abstract")) and allow_remote_arxiv and cooldown_remaining("arxiv") <= 0:
         try:
             response = get("https://export.arxiv.org/api/query", params={"search_query": f'ti:\"{clean(row.get("title"))}\"', "start": 0, "max_results": 5}, timeout=90)
@@ -748,6 +742,28 @@ def _restore_acm_checkpoints(venue_id: str, year: int, rows: list[dict[str, Any]
     return restored
 
 
+def _restore_acm_partial_metadata(venue_id: str, year: int, rows: list[dict[str, Any]]) -> int:
+    """Reuse verified per-row fields without treating an old partial corpus as a cache hit."""
+    venue = DBLP_TEMPLATES[venue_id][0]
+    payload = read_json(METADATA_CACHE_ROOT / "conference" / venue / f"{year}.json", {})
+    saved_rows = payload.get("papers") if isinstance(payload, dict) and isinstance(payload.get("papers"), list) else []
+    saved_by_title = {title_key(row.get("title")): row for row in saved_rows if isinstance(row, dict) and title_key(row.get("title"))}
+    restored = 0
+    for row in rows:
+        saved = saved_by_title.get(title_key(row.get("title")))
+        if not isinstance(saved, dict) or not clean(saved.get("abstract")):
+            continue
+        row["abstract"] = clean(saved.get("abstract"))
+        row["pdf_url"] = clean(row.get("pdf_url")) or clean(saved.get("pdf_url"))
+        row.setdefault("metadata", {}).setdefault("indexed_enrichment", []).append({
+            "source": "partial_metadata_exact_title_checkpoint",
+            "conference": venue,
+            "year": year,
+        })
+        restored += 1
+    return restored
+
+
 def _save_acm_checkpoint(venue_id: str, year: int, row: dict[str, Any]) -> None:
     write_json(_acm_checkpoint_path(venue_id, year, row), {
         "schema_version": 1,
@@ -831,6 +847,211 @@ def _batch_semantic_scholar_enrich(rows: list[dict[str, Any]]) -> list[dict[str,
     return rows
 
 
+def _chatpaper_cache_path():
+    return DATA_ROOT / "state" / "chatpaper-acm-abstracts.json"
+
+
+def _save_chatpaper_cache(cache: dict[str, Any]) -> None:
+    path = _chatpaper_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(path) + ".lock"):
+        existing = read_json(path, {})
+        if isinstance(existing, dict):
+            existing.setdefault("titles", {}).update(cache.get("titles") or {})
+            existing.setdefault("venues", {}).update(cache.get("venues") or {})
+            completed = list(dict.fromkeys([*(existing.get("completed_tracks") or []), *(cache.get("completed_tracks") or [])]))
+            existing["completed_tracks"] = completed
+            cache.clear()
+            cache.update(existing)
+        write_json(path, cache)
+
+
+def _chatpaper_scalar(payload: list[Any], reference: Any) -> Any:
+    value = reference
+    seen: set[int] = set()
+    while type(value) is int and 0 <= value < len(payload) and value not in seen:
+        seen.add(value)
+        value = payload[value]
+    if isinstance(value, list) and len(value) == 2 and value[0] in {"ShallowReactive", "Reactive", "Ref", "ShallowRef"}:
+        return _chatpaper_scalar(payload, value[1])
+    return value
+
+
+def _chatpaper_page_rows(page_text: str, venue: str, year: int) -> list[dict[str, Any]]:
+    soup = BeautifulSoup(page_text, "html.parser")
+    node = soup.select_one("#__NUXT_DATA__")
+    try:
+        payload = json.loads((node.string or node.get_text()) if node else "")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = []
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    if not isinstance(payload, list):
+        return rows
+    for value in payload:
+        if not isinstance(value, dict) or not {"title", "abstract"}.issubset(value):
+            continue
+        title = re.sub(r"^\d+\.\s*", "", clean(_chatpaper_scalar(payload, value.get("title"))))
+        abstract = clean(_chatpaper_scalar(payload, value.get("abstract")))
+        paper_id = clean(_chatpaper_scalar(payload, value.get("id")))
+        source_id = clean(_chatpaper_scalar(payload, value.get("source_id")))
+        article_url = clean(_chatpaper_scalar(payload, value.get("article_url")))
+        pdf_url = clean(_chatpaper_scalar(payload, value.get("pdf_url")))
+        key = title_key(title)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        doi_match = re.search(r"10\.\d{4,9}/[^\s<>]+", f"{source_id} {article_url}", re.I)
+        rows.append({
+            "title": title,
+            "abstract": abstract if len(abstract) >= 80 else "",
+            "doi": doi_match.group(0).rstrip(".,)").lower() if doi_match else "",
+            "url": f"https://chatpaper.com/paper/{paper_id}" if paper_id.isdigit() else "",
+            "pdf_url": pdf_url,
+            "venue": venue,
+            "year": year,
+        })
+    return rows
+
+
+def _chatpaper_track_ids(venue: str, year: int, cache: dict[str, Any]) -> list[int]:
+    venue_key = f"{venue}:{year}"
+    venue_cache = cache.setdefault("venues", {})
+    saved = venue_cache.get(venue_key) if isinstance(venue_cache, dict) else None
+    if isinstance(saved, dict) and isinstance(saved.get("track_ids"), list) and saved.get("track_ids"):
+        return [int(value) for value in saved["track_ids"] if str(value).isdigit()]
+    root = get("https://chatpaper.com/venues", timeout=30)
+    root.raise_for_status()
+    soup = BeautifulSoup(root.text, "html.parser")
+    target = f"{venue} {year}".lower()
+    first_id = ""
+    for link in soup.find_all("a", href=True):
+        if target not in clean(link.get_text(" ", strip=True)).lower():
+            continue
+        match = re.search(r"[?&]id=(\d+)", str(link.get("href") or ""))
+        if match:
+            first_id = match.group(1)
+            break
+    track_ids: list[int] = []
+    if first_id:
+        page = get(f"https://chatpaper.com/venues?id={first_id}&page=1", timeout=30)
+        page.raise_for_status()
+        track_soup = BeautifulSoup(page.text, "html.parser")
+        for link in track_soup.find_all("a", href=True):
+            if "Papers" not in clean(link.get_text(" ", strip=True)):
+                continue
+            match = re.search(r"[?&]id=(\d+)", str(link.get("href") or ""))
+            if match and int(match.group(1)) not in track_ids:
+                track_ids.append(int(match.group(1)))
+        if not track_ids:
+            match = re.search(r"[?&]id=(\d+)", page.url)
+            if match:
+                track_ids.append(int(match.group(1)))
+    venue_cache[venue_key] = {"track_ids": track_ids, "updated_at": time.time()}
+    _save_chatpaper_cache(cache)
+    return track_ids
+
+
+def _chatpaper_enrich(rows: list[dict[str, Any]], venue_id: str, year: int) -> dict[str, Any]:
+    venue = DBLP_TEMPLATES[venue_id][0]
+    missing = {title_key(row.get("title")): row for row in rows if not clean(row.get("abstract")) and title_key(row.get("title"))}
+    stats = {"source": "chatpaper_title_for_acm", "attempted": len(missing), "abstracts_filled": 0, "track_ids": []}
+    if not missing:
+        return stats
+    cache = read_json(_chatpaper_cache_path(), {})
+    if not isinstance(cache, dict):
+        cache = {}
+    cached_titles = cache.setdefault("titles", {})
+
+    def apply(item: dict[str, Any]) -> bool:
+        key = title_key(item.get("title"))
+        row = missing.get(key)
+        item_doi = clean(item.get("doi")).lower()
+        if row is None and item_doi:
+            row = next((candidate for candidate in missing.values() if clean((candidate.get("identifiers") or {}).get("doi")).lower() == item_doi), None)
+        abstract = clean(item.get("abstract"))
+        if row is None or len(abstract) < 80:
+            return False
+        row_doi = clean((row.get("identifiers") or {}).get("doi")).lower()
+        if row_doi and item_doi and row_doi != item_doi:
+            return False
+        row["abstract"] = abstract
+        row["pdf_url"] = clean(row.get("pdf_url")) or clean(item.get("pdf_url"))
+        row.setdefault("metadata", {}).setdefault("indexed_enrichment", []).append({
+            "source": "chatpaper_title_for_acm",
+            "url": clean(item.get("url")),
+            "identity_gate": "exact_normalized_title_plus_doi_when_available",
+        })
+        missing.pop(title_key(row.get("title")), None)
+        stats["abstracts_filled"] += 1
+        return True
+
+    for key in list(missing):
+        item = cached_titles.get(f"{venue}:{year}:{key}") if isinstance(cached_titles, dict) else None
+        if isinstance(item, dict):
+            apply(item)
+    if missing and isinstance(cached_titles, dict):
+        for item in cached_titles.values():
+            if isinstance(item, dict) and item.get("venue") == venue and int(item.get("year") or 0) == year:
+                apply(item)
+    if not missing:
+        return stats
+    try:
+        track_ids = _chatpaper_track_ids(venue, year, cache)
+    except Exception as exc:
+        stats["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+        return stats
+    stats["track_ids"] = track_ids
+    completed_tracks = cache.setdefault("completed_tracks", [])
+    for track_id in track_ids:
+        track_key = f"{venue}:{year}:{track_id}"
+        if track_key in completed_tracks:
+            continue
+        seen_track_titles: set[str] = set()
+        for page_number in range(1, 81):
+            try:
+                response = get(f"https://chatpaper.com/venues?id={track_id}&page={page_number}", timeout=30)
+                response.raise_for_status()
+            except Exception as exc:
+                stats.setdefault("errors", []).append(f"track={track_id} page={page_number}: {type(exc).__name__}: {str(exc)[:200]}")
+                break
+            page_rows = _chatpaper_page_rows(response.text, venue, year)
+            if not page_rows:
+                completed_tracks.append(track_key)
+                _save_chatpaper_cache(cache)
+                break
+            new_rows = [item for item in page_rows if title_key(item.get("title")) not in seen_track_titles]
+            if not new_rows:
+                completed_tracks.append(track_key)
+                _save_chatpaper_cache(cache)
+                break
+            for item in new_rows:
+                key = title_key(item.get("title"))
+                seen_track_titles.add(key)
+                if key in missing and not clean(item.get("abstract")) and clean(item.get("url")):
+                    try:
+                        paper_page = get(clean(item.get("url")), timeout=30)
+                        paper_page.raise_for_status()
+                        paper_soup = BeautifulSoup(paper_page.text, "html.parser")
+                        page_title_node = paper_soup.select_one(".doc-name-main")
+                        page_abstract_node = paper_soup.select_one("#abstract.doc-abstract") or paper_soup.select_one(".doc-abstract")
+                        page_title = re.sub(r"^\d+\.\s*", "", clean(page_title_node.get_text(" ", strip=True) if page_title_node else ""))
+                        page_abstract = clean(page_abstract_node.get_text(" ", strip=True) if page_abstract_node else "")
+                        if title_key(page_title) == key and len(page_abstract) >= 80:
+                            item["title"] = page_title
+                            item["abstract"] = page_abstract
+                    except Exception as exc:
+                        stats.setdefault("errors", []).append(f"paper={item.get('url')}: {type(exc).__name__}: {str(exc)[:200]}")
+                if clean(item.get("abstract")):
+                    cached_titles[f"{venue}:{year}:{key}"] = item
+                apply(item)
+            _save_chatpaper_cache(cache)
+            if not missing:
+                return stats
+    stats["remaining"] = len(missing)
+    return stats
+
+
 DBLP_TEMPLATES = {
     "kdd": ("KDD", "https://dblp.org/db/conf/kdd/kdd{year}.xml"),
     "sigir": ("SIGIR", "https://dblp.org/db/conf/sigir/sigir{year}.xml"),
@@ -888,9 +1109,17 @@ def _official_acm_title_seed(venue_id: str, year: int) -> tuple[list[dict[str, A
     if venue_id == "www":
         urls = [f"https://www{year}.thewebconf.org/accepted/research-tracks.html"]
     elif venue_id == "sigir":
-        urls = [f"https://sigir{year}.dei.unipd.it/accepted-papers.html", f"https://sigir{year}.dei.unipd.it/proceedings.html"]
+        urls = [
+            f"https://sigir{year}.org/en-AU/pages/program/accepted-papers",
+            f"https://sigir{year}.dei.unipd.it/accepted-papers.html",
+            f"https://sigir{year}.dei.unipd.it/proceedings.html",
+        ]
     elif venue_id == "cikm":
-        urls = [f"https://cikm{year}.org/program/proceedings"]
+        urls = [
+            f"https://www.cikm{year}.org/program/accepted-papers",
+            f"https://cikm{year}.org/program/accepted-papers",
+            f"https://cikm{year}.org/program/proceedings",
+        ]
     rows: list[dict[str, Any]] = []
     receipts: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -901,14 +1130,39 @@ def _official_acm_title_seed(venue_id: str, year: int) -> tuple[list[dict[str, A
         except Exception:
             continue
         receipts.append(receipt(response))
-        soup = BeautifulSoup(response.text, "html.parser")
-        candidates = soup.select("article, tr, li, .paper, .accepted-paper, .paper-item, .program-item")
-        if not candidates:
-            candidates = soup.find_all(["p", "div"])
+        page_text = response.text
+        if venue_id == "sigir":
+            # Current SIGIR pages place the accepted-paper markup in escaped
+            # Next.js flight data rather than in the visible DOM.
+            page_text = html.unescape(page_text).replace("\\u003c", "<").replace("\\u003e", ">").replace("\\u0026", "&")
+            embedded_paragraphs = "".join(re.findall(r"<p(?:\s[^>]*)?>.*?</p>", page_text, re.I | re.S))
+            soup = BeautifulSoup(embedded_paragraphs, "html.parser")
+        else:
+            soup = BeautifulSoup(page_text, "html.parser")
+        if venue_id == "cikm":
+            candidates = soup.find_all("tr")
+        elif venue_id == "sigir":
+            candidates = [node for node in soup.find_all("p") if node.find("i") and re.search(r"\[[a-z]+]", node.get_text(" ", strip=True), re.I)]
+        elif venue_id == "www":
+            candidates = [node for node in soup.find_all("li") if node.select_one(".paper-id")]
+        else:
+            candidates = soup.select("article, tr, li, .paper, .accepted-paper, .paper-item, .program-item")
         for node in candidates:
             anchor = node.find("a", href=True)
-            title_node = node.select_one(".title, .paper-title, h3, h4") or anchor
-            title = clean(title_node.get_text(" ", strip=True) if title_node else "")
+            cells = node.find_all(["td", "th"], recursive=False)
+            if venue_id == "cikm" and len(cells) >= 2:
+                title = clean(cells[1].get_text(" ", strip=True))
+            elif venue_id == "cikm":
+                continue
+            elif venue_id == "sigir":
+                title_node = node.find("i")
+                title = clean(title_node.get_text(" ", strip=True) if title_node else "")
+            else:
+                title_node = node.select_one(".title, .paper-title, h3, h4") or anchor
+                title = clean(title_node.get_text(" ", strip=True) if title_node else node.get_text(" ", strip=True))
+                if venue_id in {"www", "sigir"}:
+                    title = re.sub(r"^\s*(?:\([^)]*\)|\[[^]]*\]|[a-z]{1,5}\d{2,})\s*", "", title, flags=re.I)
+                    title = re.split(r"\s+(?:—|–|--)\s+", title, maxsplit=1)[0]
             title = re.sub(r"^(?:research|applied|paper)\s*[:#-]?\s*", "", title, flags=re.I)
             key = title_key(title)
             if not looks_like_title(title) or key in seen or len(title) > 500:
@@ -920,7 +1174,21 @@ def _official_acm_title_seed(venue_id: str, year: int) -> tuple[list[dict[str, A
             detail_url = urljoin(url, str(anchor.get("href") or "")) if anchor else ""
             text = clean(node.get_text(" ", strip=True))
             doi_match = re.search(r"10\.1145/\d+(?:\.\d+)?", f"{detail_url} {text}", re.I)
-            rows.append({"title": title, "abstract": "", "authors": [], "published": f"{year}-01-01", "year": year, "url": detail_url, "pdf_url": "", "venue": venue, "categories": [], "identifiers": {"doi": doi_match.group(0) if doi_match else ""}, "metadata": {"official_accepted_source": url}})
+            authors: list[str] = []
+            if venue_id == "cikm" and len(cells) >= 3:
+                for affiliation in cells[2].find_all("i"):
+                    affiliation.decompose()
+                authors = [clean(value) for value in re.split(r"\s*(?:,|\band\b)\s*", cells[2].get_text(" ", strip=True), flags=re.I) if clean(value)]
+            elif venue_id == "www":
+                author_node = node.select_one(".paper-authors")
+                authors = [clean(value) for value in re.split(r"\s*(?:,|\band\b)\s*", author_node.get_text(" ", strip=True) if author_node else "", flags=re.I) if clean(value)]
+            elif venue_id == "sigir" and title_node:
+                remainder = node.get_text(" ", strip=True).replace("\\n", " ")
+                remainder = remainder.split(title, 1)[-1]
+                authors = [clean(value) for value in re.split(r"\s*(?:,|\band\b)\s*", remainder, flags=re.I) if clean(value)]
+            rows.append({"title": title, "abstract": "", "authors": authors, "published": f"{year}-01-01", "year": year, "url": detail_url, "pdf_url": "", "venue": venue, "categories": [], "identifiers": {"doi": doi_match.group(0) if doi_match else ""}, "metadata": {"official_accepted_source": url}})
+        if rows:
+            break
     return rows, receipts
 
 
@@ -982,37 +1250,19 @@ def fetch_acm_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[st
     discovered_count = len(rows)
     rows = _selected_rows(spec, rows)
     probe_only = bool(_probe_limit(spec))
+    restored_partial_metadata = 0 if probe_only else _restore_acm_partial_metadata(venue_id, year, rows)
     restored_checkpoints = 0 if probe_only else _restore_acm_checkpoints(venue_id, year, rows)
     _batch_local_arxiv_enrich(rows)
     # TASTE permits indexed abstract enrichment for ACM venues, but never accepts
     # the DBLP title seed by itself as a verified cache.
     _batch_openalex_enrich(rows)
     _batch_semantic_scholar_enrich(rows)
+    chatpaper_stats = _chatpaper_enrich(rows, venue_id, year)
     if not probe_only:
         for row in rows:
             if clean(row.get("abstract")):
                 _save_acm_checkpoint(venue_id, year, row)
         _write_acm_progress(venue_id, year, rows, "batch_index_enrichment")
-    if not probe_only and spec.get("require_complete_abstracts") is False:
-        proof = "official_accepted_pool_merged_with_complete_dblp_title_pool" if official_rows else "complete_dblp_title_pool"
-        result_rows, details = _finish_rows(
-            spec,
-            rows,
-            adapter=f"{venue_id}_acm_enriched",
-            requests=requests,
-            proof=proof,
-            discovered_count=discovered_count,
-        )
-        details.update({
-            "official_title_pool_count": len(official_rows),
-            "restored_checkpoints": restored_checkpoints,
-            "checkpoint_mode": "per_paper_resumable",
-            "optional_per_paper_abstract_enrichment": "skipped_for_explicit_catalog_core_workflow",
-        })
-        stage_dir = _acm_stage_dir(venue_id, year)
-        if stage_dir.is_dir():
-            shutil.rmtree(stage_dir)
-        return result_rows, details
     missing_rows = [row for row in rows if not clean(row.get("abstract"))]
     # ACM often challenges automated clients.  Probe serially and stop at the
     # first persisted cooldown so queued workers cannot each wait 60 seconds.
@@ -1027,6 +1277,14 @@ def fetch_acm_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[st
     # Source cooldown is process-wide.  Keep fallback enrichment sequential so
     # workers cannot all pass a preflight check and then queue behind the same
     # newly-issued 403/429 cooldown.
+    openalex_wait = cooldown_remaining("openalex")
+    if not probe_only and len(missing_rows) > 50 and openalex_wait > 300:
+        _write_acm_progress(venue_id, year, rows, "deferred_openalex_daily_cooldown")
+        raise RuntimeError(
+            f"{venue_id}_acm_enriched deferred with {len(missing_rows)} abstracts remaining; "
+            f"OpenAlex shared cooldown has {round(openalex_wait)} seconds remaining. "
+            "Per-paper fallbacks were not expanded into a long serial wait; resume this exact source after the cooldown."
+        )
     try:
         arxiv_budget = max(0, int(os.environ.get("RECOMMEND_PAPERS_ACM_ARXIV_FALLBACK_BUDGET", "12")))
     except ValueError:
@@ -1053,7 +1311,9 @@ def fetch_acm_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[st
         "official_title_pool_count": len(official_rows),
         "dblp_seed_count": discovered_count - max(0, len([row for row in official_rows if title_key(row.get('title')) not in seen])),
         "restored_checkpoints": restored_checkpoints,
+        "restored_partial_metadata_rows": restored_partial_metadata,
         "checkpoint_mode": "disabled_for_probe" if probe_only else "per_paper_resumable",
+        "chatpaper_abstract_enrichment": chatpaper_stats,
         "remote_arxiv_fallback_attempts": arxiv_attempts,
         "remote_arxiv_fallback_budget": None if probe_only else arxiv_budget,
     })

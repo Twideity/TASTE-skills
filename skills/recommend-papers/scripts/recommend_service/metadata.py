@@ -643,7 +643,6 @@ def _fetch_venue_exact(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], dict
             )
         audit = venue_metadata_audit(
             normalized,
-            require_complete_abstracts=bool(merged.get("require_complete_abstracts", True)),
             require_official_categories=bool(merged.get("require_official_categories")),
         )
         if not audit["metadata_completeness_ok"]:
@@ -796,7 +795,7 @@ def fetch_openreview_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             "metadata_sample_complete": bool(samples) and missing == 0,
             "adapter": "openreview",
         }
-    audit = venue_metadata_audit(rows, require_complete_abstracts=bool(spec.get("require_complete_abstracts")), require_official_categories=bool(spec.get("require_official_categories")))
+    audit = venue_metadata_audit(rows, require_official_categories=bool(spec.get("require_official_categories")))
     if not audit["metadata_completeness_ok"]:
         raise RuntimeError(f"OpenReview venue metadata completeness audit failed: {audit}")
     return rows, {
@@ -813,7 +812,7 @@ def fetch_openreview_venue(spec: dict[str, Any]) -> tuple[list[dict[str, Any]], 
     }
 
 
-def venue_metadata_audit(rows: list[dict[str, Any]], *, require_complete_abstracts: bool = False, require_official_categories: bool = False) -> dict[str, Any]:
+def venue_metadata_audit(rows: list[dict[str, Any]], *, require_official_categories: bool = False) -> dict[str, Any]:
     count = len(rows)
     identities = [paper_identity(row) for row in rows]
     unique = len(set(identities))
@@ -823,8 +822,7 @@ def venue_metadata_audit(rows: list[dict[str, Any]], *, require_complete_abstrac
     abstracted = sum(bool(clean(row.get("abstract"))) for row in rows)
     categorized = sum(bool(row.get("categories")) for row in rows)
     complete = bool(count and unique and titled == count and authored / count >= 0.95 and linked / count >= 0.95)
-    if require_complete_abstracts:
-        complete = complete and abstracted == count
+    complete = complete and abstracted == count
     if require_official_categories:
         complete = complete and categorized == count
     return {
@@ -836,10 +834,30 @@ def venue_metadata_audit(rows: list[dict[str, Any]], *, require_complete_abstrac
         "link_coverage": round(linked / count, 6) if count else 0.0,
         "abstract_coverage": round(abstracted / count, 6) if count else 0.0,
         "category_coverage": round(categorized / count, 6) if count else 0.0,
-        "full_abstract_required": require_complete_abstracts,
+        "full_abstract_required": True,
         "official_categories_expected": require_official_categories,
         "metadata_completeness_ok": complete,
     }
+
+
+def _complete_conference_cache(payload: Any, source: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    """Apply the single formal conference-cache contract at every cache boundary."""
+    if not isinstance(payload, dict):
+        return False, {}
+    receipt_data = payload.get("receipt") if isinstance(payload.get("receipt"), dict) else {}
+    rows = payload.get("papers") if isinstance(payload.get("papers"), list) else []
+    venue_id = clean(source.get("venue_id") or source.get("venue")).lower()
+    audit = venue_metadata_audit(
+        rows,
+        require_official_categories=venue_id in {"iclr", "icml"},
+    )
+    complete = (
+        receipt_data.get("status") == "complete"
+        and receipt_data.get("complete_catalog") is True
+        and bool(receipt_data.get("exhaustion_proof"))
+        and audit["metadata_completeness_ok"]
+    )
+    return complete, audit
 
 
 def _crossref_date(item: dict[str, Any]) -> str:
@@ -1009,6 +1027,11 @@ def validate_plan(plan: Any) -> dict[str, Any]:
                 raise ValueError(f"sources[{index}] venue requires exactly one resolved year")
             if source.get("complete_catalog") is not True:
                 raise ValueError(f"sources[{index}] venue must set complete_catalog=true")
+            if source.get("require_complete_abstracts") is False:
+                raise ValueError(
+                    f"sources[{index}] venue cannot disable abstracts; every formal conference record must have a real abstract"
+                )
+            source["require_complete_abstracts"] = True
             if any(key in source for key in ("limit", "max_results", "sample_limit")):
                 raise ValueError(f"sources[{index}] venue cannot use a result limit; conference metadata must be complete")
             if any(source.get(key) for key in ("queries", "categories", "tracks")):
@@ -1130,11 +1153,11 @@ def _recover_conference_caches_from_runs() -> list[dict[str, Any]]:
         if clean(source.get("type")).lower() != "venue" or len(source.get("years") or []) != 1:
             continue
         details = ((row.get("cache") or {}).get("details") or {}) if isinstance(row.get("cache"), dict) else {}
-        if details.get("status") != "complete" or details.get("complete_catalog") is not True or not details.get("exhaustion_proof"):
-            continue
         target = _source_cache_path(source, stable_hash(source))
         if target.is_file():
-            continue
+            existing = read_json(target, {})
+            if _complete_conference_cache(existing, source)[0]:
+                continue
         metadata = read_json(receipt_path.parent.parent / "metadata.json", {})
         venue_id = clean(source.get("venue_id") or source.get("venue")).lower()
         venue_names = {"iclr": {"iclr"}, "icml": {"icml"}, "neurips": {"neurips", "nips"}}.get(venue_id, {venue_id})
@@ -1142,6 +1165,10 @@ def _recover_conference_caches_from_runs() -> list[dict[str, Any]]:
         if len(papers) != int(row.get("paper_count") or 0) or len(papers) != int(details.get("count") or 0):
             continue
         payload = {"schema_version": 1, "cache_key": stable_hash(source), "source": source, "fetched_at": clean((row.get("cache") or {}).get("fetched_at")) or now_iso(), "papers": papers, "receipt": details}
+        complete, audit = _complete_conference_cache(payload, source)
+        if not complete:
+            continue
+        payload["receipt"]["metadata_audit"] = audit
         write_json(target, payload)
         recovered.append({"venue": venue_id, "year": int(source["years"][0]), "papers": len(papers), "destination": str(target), "source_run": receipt_path.parent.parent.name})
     return recovered
@@ -1170,7 +1197,11 @@ def migrate_metadata_caches() -> dict[str, Any]:
             else:
                 moves.append(_move_preserving(path, _source_cache_path(source, path.stem)))
         for (venue, year), candidates in venue_groups.items():
-            complete = [(path, payload) for path, payload in candidates if isinstance(payload.get("receipt"), dict) and payload["receipt"].get("status") == "complete" and payload["receipt"].get("complete_catalog") is True and payload["receipt"].get("exhaustion_proof")]
+            complete = [
+                (path, payload)
+                for path, payload in candidates
+                if _complete_conference_cache(payload, payload.get("source") if isinstance(payload.get("source"), dict) else {})[0]
+            ]
             if not complete:
                 for path, _ in candidates:
                     path.unlink()
@@ -1283,15 +1314,8 @@ def fetch_source(spec: dict[str, Any], *, policy: str, max_age_days: float) -> t
             else cached_receipt.get("exhausted") is True and cached_receipt.get("truncated") is False and bool(cached_receipt.get("exhaustion_proof")) if kind == "biorxiv"
             else True
         )
-        venue_id = clean(spec.get("venue_id") or spec.get("venue")).lower()
-        if kind == "venue" and venue_id in PRIORITY_VENUE_NAMES:
-            cached_rows = cached.get("papers") if isinstance(cached.get("papers"), list) else []
-            audit = venue_metadata_audit(
-                cached_rows,
-                require_complete_abstracts=bool(spec.get("require_complete_abstracts", True)),
-                require_official_categories=venue_id in {"iclr", "icml"},
-            )
-            cache_has_required_coverage = cache_has_required_coverage and audit["metadata_completeness_ok"]
+        if kind == "venue":
+            cache_has_required_coverage, _audit = _complete_conference_cache(cached, spec)
         if cache_has_required_coverage:
             return cached["papers"], {"status": "cache_hit", "cache_path": str(cache_path), "fetched_at": cached.get("fetched_at"), "count": len(cached["papers"]), "details": cached_receipt}
     if policy == "only":
@@ -1300,6 +1324,12 @@ def fetch_source(spec: dict[str, Any], *, policy: str, max_age_days: float) -> t
     if kind == "venue" and source_receipt.get("complete_catalog") is not True:
         raise RuntimeError("Venue adapter did not prove complete-catalog acquisition")
     normalized = [normalize(item, kind) for item in papers if isinstance(item, dict) and clean(item.get("title"))]
+    if kind == "venue":
+        candidate_payload = {"papers": normalized, "receipt": source_receipt}
+        complete, audit = _complete_conference_cache(candidate_payload, spec)
+        if not complete:
+            raise RuntimeError(f"Conference metadata cannot be cached until every record has a real abstract: {audit}")
+        source_receipt["metadata_audit"] = audit
     if kind == "venue" and isinstance(source_receipt.get("effective_years"), list) and len(source_receipt["effective_years"]) == 1:
         effective_spec = dict(spec)
         effective_spec["years"] = [int(source_receipt["effective_years"][0])]

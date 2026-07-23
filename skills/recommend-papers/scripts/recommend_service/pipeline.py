@@ -112,7 +112,6 @@ def _metadata_coverage_notices(receipts: list[dict[str, Any]]) -> list[dict[str,
                 "present_count": present,
                 "missing_count": total - present,
                 "coverage": coverage.get(f"{field}_coverage"),
-                "catalog_core_exception": bool(source.get("require_complete_abstracts") is False),
             })
     return notices
 
@@ -227,7 +226,6 @@ def _run_metadata_locked(plan_path: Path, directory: Path) -> dict[str, Any]:
     all_rows = [paper for index in range(1, len(sources) + 1) for paper in papers_by_index.get(index, [])]
     papers = deduplicate(all_rows)
     coverage_notices = _metadata_coverage_notices(receipts)
-    metadata_profile = "catalog_core" if any(source.get("require_complete_abstracts") is False for source in sources) else "full_metadata"
     status = "complete" if papers and not warnings else "complete_with_gaps" if papers else "blocked"
     payload = {
         "schema_version": 1,
@@ -240,7 +238,7 @@ def _run_metadata_locked(plan_path: Path, directory: Path) -> dict[str, Any]:
         "probe_proofs": probe_proofs,
         "plan_fingerprint": stable_hash(plan),
         "metadata_fingerprint": stable_hash({"plan": plan, "probe_proofs": probe_proofs, "papers": papers}),
-        "metadata_profile": metadata_profile,
+        "metadata_profile": "full_metadata",
         "coverage_notices": coverage_notices,
         "papers": papers,
         "source_receipts": receipts,
@@ -279,8 +277,6 @@ def build_shortlist(run_dir: Path, scores_path: Path, target: int | None) -> dic
         raise ValueError("metadata.json is missing or empty")
     if metadata.get("status") is not None and metadata.get("status") != "complete":
         raise ValueError("metadata coverage is incomplete; repair all source receipts before scoring")
-    if metadata.get("metadata_profile") == "catalog_core":
-        raise ValueError("catalog-core metadata contains declared field gaps and cannot be used for abstract scoring")
     by_identity = {paper_identity(item): item for item in papers if isinstance(item, dict)}
     rows = _score_rows(read_json(scores_path, None))
     scored: dict[str, dict[str, Any]] = {}
